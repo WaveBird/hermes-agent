@@ -17,6 +17,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# lark_oapi is an optional dependency (hermes-agent[feishu]) — skip the entire
+# module when it is not installed so CI doesn't fail in minimal environments.
+pytest.importorskip("lark_oapi", reason="lark_oapi not installed — skipping Feishu streaming card tests")
+
 
 @patch.dict(os.environ, {}, clear=True)
 class TestBuildStreamingCardJson(unittest.TestCase):
