@@ -90,7 +90,7 @@ import sys
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -2420,6 +2420,146 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     return _handler
 
 
+def _wrap_with_approval_guard(
+    base_handler: Callable,
+    server_name: str,
+    tool_name: str,
+    arg_key: str = "command",
+    arg_keys: Optional[List[str]] = None,
+    env_type: str = "ssh",
+) -> Callable:
+    """Wrap an MCP tool handler with Hermes' dangerous-command approval.
+
+    When an MCP tool is declared in ``command_tools`` config, its handler is
+    wrapped so that the extracted command string passes through the full
+    approval pipeline (hardline, tirith, dangerous patterns, smart approval,
+    manual approval) *before* the call reaches the MCP server.
+
+    This mirrors the pre-exec guard in ``tools/terminal_tool`` — the agent
+    thread blocks until the user responds (gateway) or the interactive prompt
+    resolves (CLI), then either proceeds or receives a definitive BLOCKED
+    message.
+
+    Args:
+        base_handler: The original ``_make_tool_handler`` closure.
+        server_name: MCP server name (for logging).
+        tool_name: MCP tool name (unprefixed, e.g. ``exec_command``).
+        arg_key: Primary name of the argument holding the command string.
+            Defaults to ``"command"``; some MCP servers use ``"cmd"`` or
+            ``"args"``.  When the value is a list, it is joined with spaces.
+        arg_keys: Ordered list of argument keys to probe for the command
+            string.  The first non-empty match is used.  When provided,
+            ``arg_key`` is prepended to this list.  Useful when different
+            tools in the same MCP server use different arg names (e.g.
+            Tabby's ``exec_command`` uses ``"command"`` while ``send_input``
+            uses ``"input"``).
+        env_type: Environment type for approval bypass decisions.
+            Defaults to ``"ssh"`` (remote host — no container bypass).
+            Set to ``"docker"`` for container-based MCP servers where
+            dangerous commands are safe because they can't touch the host.
+    """
+
+    # Build the ordered probe list: arg_key first, then any extras.
+    _probe_keys = [arg_key]
+    if arg_keys:
+        for k in arg_keys:
+            if k not in _probe_keys:
+                _probe_keys.append(k)
+    # Capture env_type in closure (avoid name collision with local vars).
+    _env_type = env_type
+
+    def _guarded_handler(args: dict, **kwargs) -> str:
+        # ── Extract the command string ──
+        # Probe arg keys in priority order; first non-empty match wins.
+        command = ""
+        for key in _probe_keys:
+            val = args.get(key, "")
+            if isinstance(val, list):
+                val = " ".join(str(c) for c in val)
+            elif not isinstance(val, str):
+                # Coerce non-string types (int, float, None) so the
+                # approval guard doesn't silently bypass them.
+                if val is not None and val != "":
+                    val = str(val)
+            if isinstance(val, str) and val.strip():
+                command = val
+                break
+
+        if command:
+            # ── Run the full approval pipeline ──
+            # env_type is configurable per MCP server (default: "ssh"
+            # for remote-host exec tools like Tabby). Container-based
+            # MCP servers can set env_type="docker" in config to get
+            # the same container bypass as terminal_tool.
+            from tools.approval import check_all_command_guards
+
+            # Acquire the per-thread approval callback from terminal_tool
+            # so CLI interactive prompts work (without this, prompt_toolkit
+            # detects stdin deadlock and auto-denies — issue #1).
+            # Gateway mode uses the per-session _gateway_notify_cbs
+            # mechanism and does NOT depend on this callback.
+            _approval_callback = None
+            try:
+                from tools.terminal_tool import _get_approval_callback
+                _approval_callback = _get_approval_callback()
+            except Exception:
+                pass  # terminal_tool not loaded (tests, minimal env)
+
+            approval = check_all_command_guards(
+                command, env_type=_env_type,
+                approval_callback=_approval_callback,
+            )
+            if not approval["approved"]:
+                # Reset server error counter — this is a *user* decision,
+                # not a server failure.  Otherwise the circuit breaker would
+                # penalize the server for something it never did.
+                _reset_server_error(server_name)
+
+                # Build a terminal_tool-style result so the agent treats it
+                # like a blocked terminal command (consistent UX across
+                # built-in and MCP tools).
+                # Special case: when the approval system returned
+                # "approval_required" (no gateway notify_cb registered,
+                # e.g. cron/batch), include the extra metadata so the
+                # agent knows what pattern was flagged.
+                message = approval.get(
+                    "message",
+                    f"BLOCKED: command denied ({command[:100]})",
+                )
+                logger.info(
+                    "MCP approval guard blocked '%s/%s': command=%r reason=%s",
+                    server_name, tool_name, command[:80], message[:120],
+                )
+                result_dict = {
+                    "output": "",
+                    "exit_code": -1,
+                    "error": message,
+                    "status": "blocked",
+                }
+                if approval.get("status") == "approval_required":
+                    result_dict["status"] = "approval_required"
+                    result_dict["command"] = approval.get("command", command)
+                    result_dict["description"] = approval.get("description", "command flagged")
+                    result_dict["pattern_key"] = approval.get("pattern_key", "")
+                return json.dumps(result_dict, ensure_ascii=False)
+
+            # Approval passed → log for audit trail
+            if approval.get("user_approved") or approval.get("smart_approved"):
+                desc = approval.get("description", "flagged as dangerous")
+                logger.info(
+                    "MCP approval guard passed '%s/%s': command=%r "
+                    "approved via %s (%s)",
+                    server_name, tool_name, command[:80],
+                    "user" if approval.get("user_approved") else "smart",
+                    desc,
+                )
+
+        # ── Approved (or no command to check) → delegate to base handler ──
+        return base_handler(args, **kwargs)
+
+    return _guarded_handler
+
+
 def _make_list_resources_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists resources from an MCP server."""
 
@@ -3050,6 +3190,33 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     include_set = _normalize_name_filter(tools_filter.get("include"), f"mcp_servers.{name}.tools.include")
     exclude_set = _normalize_name_filter(tools_filter.get("exclude"), f"mcp_servers.{name}.tools.exclude")
 
+    # Command-execution tool approval: tools listed in ``command_tools``
+    # are wrapped with Hermes' dangerous-command approval guard so the
+    # full approval pipeline (hardline, tirith, dangerous patterns, smart
+    # approval, manual approval) applies before the command reaches the
+    # MCP server.
+    #
+    # Config keys:
+    #   command_tools      — list of MCP tool names requiring approval
+    #   command_arg_key    — primary arg name holding the command string
+    #                         (default: "command"; YAML type-coerced to str)
+    #   command_arg_keys   — additional arg names to probe (default: [];
+    #                         YAML type-coerced to list)
+    #   command_env_type   — env_type for approval bypass (default: "ssh";
+    #                         use "docker" for container-based MCP servers)
+    command_tools_set = set(config.get("command_tools") or [])
+    # YAML type coercion: single-item list → string for arg_key,
+    # bare string → list for arg_keys.
+    raw_arg_key = config.get("command_arg_key", "command")
+    if isinstance(raw_arg_key, list) and len(raw_arg_key) == 1:
+        raw_arg_key = raw_arg_key[0]
+    command_arg_key = str(raw_arg_key) if raw_arg_key else "command"
+    raw_arg_keys = config.get("command_arg_keys")
+    if isinstance(raw_arg_keys, str):
+        raw_arg_keys = [raw_arg_keys]
+    command_arg_keys = list(raw_arg_keys) if raw_arg_keys else []
+    command_env_type = config.get("command_env_type", "ssh")
+
     def _should_register(tool_name: str) -> bool:
         if include_set:
             return tool_name in include_set
@@ -3078,11 +3245,29 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             )
             continue
 
+        # Wrap command-execution tools with the approval guard when
+        # declared in config.  Other tools pass through unchanged.
+        base_handler = _make_tool_handler(name, mcp_tool.name, server.tool_timeout)
+        if mcp_tool.name in command_tools_set:
+            handler = _wrap_with_approval_guard(
+                base_handler, name, mcp_tool.name,
+                command_arg_key, command_arg_keys,
+                env_type=command_env_type,
+            )
+            logger.debug(
+                "MCP server '%s': tool '%s' wrapped with approval guard "
+                "(arg_key=%s, arg_keys=%s, env_type=%s)",
+                name, mcp_tool.name, command_arg_key, command_arg_keys,
+                command_env_type,
+            )
+        else:
+            handler = base_handler
+
         registry.register(
             name=tool_name_prefixed,
             toolset=toolset_name,
             schema=schema,
-            handler=_make_tool_handler(name, mcp_tool.name, server.tool_timeout),
+            handler=handler,
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],
