@@ -138,11 +138,53 @@ class GatewayStreamConsumer:
 
                 if should_edit and self._accumulated:
                     # Split overflow: if accumulated text exceeds the platform
-                    # limit, finalize the current message and start a new one.
+                    # limit, split into properly sized chunks.
+                    if (
+                        _len_fn(self._accumulated) > _safe_limit
+                        and self._message_id is None
+                    ):
+                        # No existing message to edit (first message or after a
+                        # segment break).  Use truncate_message — the same
+                        # helper the non-streaming path uses — to split with
+                        # proper word/code-fence boundaries and chunk
+                        # indicators like "(1/2)".
+                        chunks = self.adapter.truncate_message(
+                            self._accumulated, _safe_limit, len_fn=_len_fn,
+                        )
+                        chunks_delivered = False
+                        reply_to = self._message_id or self._initial_reply_to_id
+                        for chunk in chunks:
+                            new_id = await self._send_new_chunk(chunk, reply_to)
+                            if new_id is not None and new_id != reply_to:
+                                chunks_delivered = True
+                        self._accumulated = ""
+                        self._last_sent_text = ""
+                        self._last_edit_time = time.monotonic()
+                        if got_done:
+                            # Only claim final delivery if THESE chunks actually
+                            # landed.  ``_already_sent`` may be True from prior
+                            # tool-progress edits or fallback-mode promotion (#10748)
+                            # — that doesn't mean the final answer reached the user.
+                            self._final_response_sent = chunks_delivered
+                            if chunks_delivered:
+                                self._final_content_delivered = True
+                            return
+                        if got_segment_break:
+                            self._message_id = None
+                            self._fallback_final_send = False
+                            self._fallback_prefix = ""
+                        continue
+
+                    # Existing message: edit it with the first chunk, then
+                    # start a new message for the overflow remainder.
+                    # Streaming cards (Feishu CardKit) handle content updates as
+                    # full-text diffs server-side, so they don't need chunked
+                    # overflow splitting — the entire content is sent each time.
                     while (
                         len(self._accumulated) > _safe_limit
                         and self._message_id is not None
                         and self._edit_supported
+                        and not self._uses_streaming_card
                     ):
                         split_at = self._accumulated.rfind("\n", 0, _safe_limit)
                         if split_at < _safe_limit // 2:
@@ -156,10 +198,16 @@ class GatewayStreamConsumer:
                             # remaining continuation without dropping content.
                             break
                         self._accumulated = self._accumulated[split_at:].lstrip("\n")
-                        # Stop the current streaming card before starting a new one
-                        await self._stop_streaming_card_if_active()
-                        self._message_id = None
-                        self._last_sent_text = ""
+                        # For streaming cards (Feishu CardKit), the content
+                        # update API takes the full accumulated text and diffs
+                        # it server-side, so overflow splitting is unnecessary
+                        # and counterproductive — it would kill the card and
+                        # create a new one for each chunk.  Skip the reset.
+                        if not self._uses_streaming_card:
+                            # Stop the current streaming card before starting a new one
+                            await self._stop_streaming_card_if_active()
+                            self._message_id = None
+                            self._last_sent_text = ""
 
                     display_text = self._accumulated
                     if not got_done and not got_segment_break and not self._uses_streaming_card:
