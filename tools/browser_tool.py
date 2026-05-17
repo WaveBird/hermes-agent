@@ -111,6 +111,14 @@ try:
 except ImportError:
     _is_camofox_mode = lambda: False  # noqa: E731
 
+# CloakBrowser local anti-detection Chromium backend (optional).
+# When CLOAKBROWSER_MODE is set, all browser operations route through
+# the cloakbrowser Playwright API instead of agent-browser CLI.
+try:
+    from tools.browser_cloakbrowser import is_cloakbrowser_mode as _is_cloakbrowser_mode
+except ImportError:
+    _is_cloakbrowser_mode = lambda: False  # noqa: E731
+
 logger = logging.getLogger(__name__)
 
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services).
@@ -623,12 +631,12 @@ def _is_local_backend() -> bool:
 
     SSRF protection is only meaningful for cloud backends (Browserbase,
     BrowserUse) where the agent could reach internal resources on a remote
-    machine.  For local backends — Camofox, or the built-in headless
-    Chromium without a cloud provider — the user already has full terminal
-    and network access on the same machine, so the check adds no security
+    machine.  For local backends — Camofox, CloakBrowser, or the built-in
+    headless Chromium without a cloud provider — the user already has full
+    terminal and network access on the same machine, so the check adds no security
     value.
     """
-    return _is_camofox_mode() or _get_cloud_provider() is None
+    return _is_camofox_mode() or _is_cloakbrowser_mode() or _get_cloud_provider() is None
 
 
 _auto_local_for_private_urls_resolved = False
@@ -692,6 +700,8 @@ def _should_inject_engine(engine: str) -> bool:
     if engine == "auto":
         return False
     if _is_camofox_mode():
+        return False
+    if _is_cloakbrowser_mode():
         return False
     return _is_local_mode()
 
@@ -1080,6 +1090,8 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     if _get_cdp_override():
         return task_id
     if _is_camofox_mode():
+        return task_id
+    if _is_cloakbrowser_mode():
         return task_id
     if _get_cloud_provider() is None:
         return task_id
@@ -1613,6 +1625,24 @@ BROWSER_TOOL_SCHEMAS = [
             "required": []
         }
     },
+    {
+        "name": "browser_click_at",
+        "description": "Click at specific pixel coordinates in the browser viewport using Playwright's native mouse.click (produces isTrusted=true events). Use this for CAPTCHAs or elements that can't be targeted by ref ID. Coordinates are viewport pixel positions (x from left, y from top). Use browser_vision first to identify coordinates visually.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "x": {
+                    "type": "number",
+                    "description": "X coordinate in viewport pixels (from left edge)"
+                },
+                "y": {
+                    "type": "number",
+                    "description": "Y coordinate in viewport pixels (from top edge)"
+                }
+            },
+            "required": ["x", "y"]
+        }
+    },
 ]
 
 
@@ -1958,7 +1988,7 @@ def _run_browser_command(
     # hybrid private-URL routing can create a local sidecar while a cloud
     # provider remains configured for public URLs.
     engine = _engine_override or _get_browser_engine()
-    if engine != "auto" and not _is_camofox_mode() and not session_info.get("cdp_url"):
+    if engine != "auto" and not _is_camofox_mode() and not _is_cloakbrowser_mode() and not session_info.get("cdp_url"):
         backend_args += ["--engine", engine]
 
     # Keep concrete executable paths intact, even when they contain spaces.
@@ -2359,6 +2389,11 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         from tools.browser_camofox import camofox_navigate
         return camofox_navigate(url, task_id)
 
+    # CloakBrowser backend — delegate after safety checks pass
+    if _is_cloakbrowser_mode():
+        from tools.browser_cloakbrowser import cloakbrowser_navigate
+        return cloakbrowser_navigate(url, task_id)
+
     if auto_local_this_nav:
         logger.info(
             "browser_navigate: auto-routing %s to local Chromium sidecar "
@@ -2505,6 +2540,10 @@ def browser_snapshot(
         from tools.browser_camofox import camofox_snapshot
         return camofox_snapshot(full, task_id, user_task)
 
+    if _is_cloakbrowser_mode():
+        from tools.browser_cloakbrowser import cloakbrowser_snapshot
+        return cloakbrowser_snapshot(full, task_id, user_task)
+
     effective_task_id = _last_session_key(task_id or "default")
 
     # Build command args based on full flag
@@ -2569,6 +2608,10 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
         from tools.browser_camofox import camofox_click
         return camofox_click(ref, task_id)
 
+    if _is_cloakbrowser_mode():
+        from tools.browser_cloakbrowser import cloakbrowser_click
+        return cloakbrowser_click(ref, task_id)
+
     effective_task_id = _last_session_key(task_id or "default")
 
     # Ensure ref starts with @
@@ -2606,6 +2649,10 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_type
         return camofox_type(ref, text, task_id)
+
+    if _is_cloakbrowser_mode():
+        from tools.browser_cloakbrowser import cloakbrowser_type
+        return cloakbrowser_type(ref, text, task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
 
@@ -2663,6 +2710,10 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
             result = camofox_scroll(direction, task_id)
         return result
 
+    if _is_cloakbrowser_mode():
+        from tools.browser_cloakbrowser import cloakbrowser_scroll
+        return cloakbrowser_scroll(direction, task_id)
+
     effective_task_id = _last_session_key(task_id or "default")
 
     result = _run_browser_command(effective_task_id, "scroll", [direction, str(_SCROLL_PIXELS)])
@@ -2693,6 +2744,10 @@ def browser_back(task_id: Optional[str] = None) -> str:
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_back
         return camofox_back(task_id)
+
+    if _is_cloakbrowser_mode():
+        from tools.browser_cloakbrowser import cloakbrowser_back
+        return cloakbrowser_back(task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
     result = _run_browser_command(effective_task_id, "back", [])
@@ -2726,6 +2781,10 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_press
         return camofox_press(key, task_id)
+
+    if _is_cloakbrowser_mode():
+        from tools.browser_cloakbrowser import cloakbrowser_press
+        return cloakbrowser_press(key, task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
     result = _run_browser_command(effective_task_id, "press", [key])
@@ -2771,6 +2830,10 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
         from tools.browser_camofox import camofox_console
         return camofox_console(clear, task_id)
 
+    if _is_cloakbrowser_mode():
+        from tools.browser_cloakbrowser import cloakbrowser_console
+        return cloakbrowser_console(clear, expression=expression, task_id=task_id)
+
     effective_task_id = _last_session_key(task_id or "default")
 
     console_args = ["--clear"] if clear else []
@@ -2813,6 +2876,10 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate a JavaScript expression in the page context and return the result."""
     if _is_camofox_mode():
         return _camofox_eval(expression, task_id)
+
+    if _is_cloakbrowser_mode():
+        from tools.browser_cloakbrowser import cloakbrowser_eval
+        return cloakbrowser_eval(expression, task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
 
@@ -2996,6 +3063,10 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         from tools.browser_camofox import camofox_get_images
         return camofox_get_images(task_id)
 
+    if _is_cloakbrowser_mode():
+        from tools.browser_cloakbrowser import cloakbrowser_get_images
+        return cloakbrowser_get_images(task_id)
+
     effective_task_id = _last_session_key(task_id or "default")
 
     # Use eval to run JavaScript that extracts images
@@ -3066,6 +3137,10 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_vision
         return camofox_vision(question, annotate, task_id)
+
+    if _is_cloakbrowser_mode():
+        from tools.browser_cloakbrowser import cloakbrowser_vision
+        return cloakbrowser_vision(question, annotate, task_id)
 
     import base64
     import uuid as uuid_mod
@@ -3611,6 +3686,10 @@ def check_browser_requirements() -> bool:
     if _is_camofox_mode():
         return True
 
+    # CloakBrowser backend — only needs cloakbrowser Python package, no agent-browser CLI
+    if _is_cloakbrowser_mode():
+        return True
+
     # CDP override mode can connect to an existing remote/local browser endpoint
     # without requiring the local agent-browser binary on PATH.
     if _get_cdp_override():
@@ -3793,4 +3872,53 @@ registry.register(
     handler=lambda args, **kw: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🖥️",
+)
+
+
+def browser_click_at(x: float, y: float, task_id: Optional[str] = None) -> str:
+    """
+    Click at specific pixel coordinates in the browser viewport.
+    Uses Playwright's native mouse.click which produces isTrusted=true events.
+    For CAPTCHAs or elements that cannot be targeted by accessibility ref ID.
+
+    Args:
+        x: X coordinate in viewport pixels (from left edge)
+        y: Y coordinate in viewport pixels (from top edge)
+
+    Returns:
+        JSON string with click result
+    """
+    if _is_cloakbrowser_mode():
+        from tools.browser_cloakbrowser import cloakbrowser_click_at
+        return cloakbrowser_click_at(x, y, task_id)
+
+    effective_task_id = _last_session_key(task_id or "default")
+
+    # For non-CloakBrowser modes, we simulate via JavaScript
+    result = _run_browser_command(effective_task_id, "evaluate", [
+        f"document.elementFromPoint({x}, {y})?.click()"
+    ])
+
+    if result.get("success"):
+        response = {
+            "success": True,
+            "x": x,
+            "y": y
+        }
+        return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+    else:
+        response = {
+            "success": False,
+            "error": result.get("error", f"Failed to click at ({x}, {y})")
+        }
+        return json.dumps(_copy_fallback_warning(response, result), ensure_ascii=False)
+
+
+registry.register(
+    name="browser_click_at",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_click_at"],
+    handler=lambda args, **kw: browser_click_at(x=args.get("x", 0), y=args.get("y", 0), task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
+    emoji="🎯",
 )
