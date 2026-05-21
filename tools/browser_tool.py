@@ -3466,6 +3466,17 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         except Exception as e:
             logger.debug("Camofox cleanup for task %s: %s", task_id, e)
 
+    # Also clean up CloakBrowser session if running in CloakBrowser mode.
+    # CloakBrowser runs in-process (local Playwright), so we must close
+    # the browser instance to release resources.
+    if _is_cloakbrowser_mode():
+        try:
+            from tools.browser_cloakbrowser import cloakbrowser_close, cloakbrowser_soft_cleanup
+            if not cloakbrowser_soft_cleanup(task_id):
+                cloakbrowser_close(task_id)
+        except Exception as e:
+            logger.debug("CloakBrowser cleanup for task %s: %s", task_id, e)
+
     logger.debug("cleanup_browser called for task_id: %s", task_id)
     logger.debug("Active sessions: %s", list(_active_sessions.keys()))
 
