@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 import logging
 import os
@@ -873,7 +874,7 @@ def cloakbrowser_network(
             if session:
                 for r in session.get("network_records", []):
                     if r.get("id") == request_id:
-                        rec = r
+                        rec = copy.deepcopy(r)  # Deep copy to avoid mutating original
                         break
             # Find on disk
             if not rec:
