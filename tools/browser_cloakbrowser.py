@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Coroutine
@@ -43,6 +44,9 @@ _DEFAULT_TIMEOUT = 30_000  # ms for Playwright operations
 _SNAPSHOT_MAX_CHARS = 80_000
 _CLOAKBROWSER_CACHE_DIR = Path.home() / ".cloakbrowser"
 _SCREENSHOTS_DIR = _CLOAKBROWSER_CACHE_DIR / "screenshots"
+_NETWORK_CACHE_DIR = _CLOAKBROWSER_CACHE_DIR / "network"
+_MAX_NETWORK_RECORDS = 200  # auto-flush threshold
+_MAX_BODY_BYTES = 100_000    # max body size to store (100KB)
 
 logger = logging.getLogger(__name__)
 
@@ -160,16 +164,24 @@ async def _async_get_session(task_id: Optional[str], headless: bool) -> Dict[str
     context = await browser.new_context(no_viewport=True)
     page = await context.new_page()
 
-    # Collect console messages
+    # Create session dict first (so handlers can reference it)
     logs: List[str] = []
-    page.on("console", lambda msg: logs.append(f"[{msg.type}] {msg.text}"))
-
     session = {
         "browser": browser,
         "context": context,
         "page": page,
         "logs": logs,
+        "network_enabled": False,  # Lazy: off by default
+        "network_records": [],    # In-memory buffer
+        "network_lock": threading.Lock(),
     }
+
+    # Collect console messages
+    page.on("console", lambda msg: logs.append(f"[{msg.type}] {msg.text}"))
+
+    # Network capture now uses CDP Network.enable (registered on-demand via start action).
+    # No page.on("response") / page.on("requestfailed") here — CDP captures everything.
+
     _sessions[task_id] = session
     return session
 
@@ -305,6 +317,640 @@ def cloakbrowser_close(task_id: Optional[str] = None) -> None:
     """Force-close a browser session."""
     tid = task_id or "default"
     cloakbrowser_soft_cleanup(tid)
+
+
+# ---------------------------------------------------------------------------
+# Network Capture — lazy, on-demand request/response recording
+# ---------------------------------------------------------------------------
+# Network records stored as JSONL files organized by domain + date:
+#   ~/.cloakbrowser/network/{YYYY-MM-DD}/{domain}.jsonl
+# Each record: {id, url, method, status, request_headers, response_headers,
+#               resource_type, timestamp, body_ref (optional), error (optional)}
+
+def _network_domain_from_url(url: str) -> str:
+    """Extract a safe domain name for filesystem use."""
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc or "unknown"
+        # Sanitize: replace problematic chars with underscore
+        domain = re.sub(r"[^\w\-.]", "_", domain)
+        return domain[:100] or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _network_date_str(ts_ms: float) -> str:
+    """Convert epoch milliseconds to YYYY-MM-DD string."""
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _network_record_to_jsonl(rec: dict) -> str:
+    """Compact JSON serialization for a network record."""
+    return json.dumps(rec, ensure_ascii=False, separators=(",", ":"))
+
+
+def _flush_network_records_to_disk(records: List[dict], task_id: str) -> int:
+    """Write captured network records to disk, organized by domain + date.
+
+    Returns number of records flushed.
+    """
+    if not records:
+        return 0
+    _NETWORK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    flushed = 0
+    # Group by (date, domain)
+    groups: Dict[str, dict] = {}
+    for rec in records:
+        date_str = _network_date_str(rec.get("timestamp", time.time() * 1000))
+        domain = _network_domain_from_url(rec.get("url", ""))
+        key = f"{date_str}/{domain}"
+        if key not in groups:
+            groups[key] = {"date": date_str, "domain": domain, "records": []}
+        groups[key]["records"].append(rec)
+
+    for key, grp in groups.items():
+        date_dir = _NETWORK_CACHE_DIR / grp["date"]
+        date_dir.mkdir(parents=True, exist_ok=True)
+        file_path = date_dir / f"{grp['domain']}.jsonl"
+        # Append mode — each line is one record
+        with open(file_path, "a", encoding="utf-8") as f:
+            for rec in grp["records"]:
+                f.write(_network_record_to_jsonl(rec) + "\n")
+                flushed += 1
+    return flushed
+
+
+def _load_network_records_from_disk(
+    domain_filter: Optional[str] = None,
+    date_filter: Optional[str] = None,
+    limit: int = 100,
+) -> List[dict]:
+    """Load network records from disk files, optionally filtered.
+
+    Returns list of records (most recent first).
+    """
+    records = []
+    try:
+        if date_filter:
+            # Load from specific date
+            date_dir = _NETWORK_CACHE_DIR / date_filter
+            if not date_dir.exists():
+                return []
+            for file in date_dir.glob("*.jsonl"):
+                if domain_filter and file.stem != domain_filter:
+                    continue
+                with open(file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            records.append(json.loads(line))
+        else:
+            # Scan all available dates (most recent first)
+            for date_dir in sorted(_NETWORK_CACHE_DIR.iterdir(), reverse=True):
+                if not date_dir.is_dir():
+                    continue
+                for file in date_dir.glob("*.jsonl"):
+                    if domain_filter and file.stem != domain_filter:
+                        continue
+                    with open(file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                records.append(json.loads(line))
+        # Sort by timestamp descending, apply limit
+        records.sort(key=lambda r: r.get("timestamp", 0), reverse=True)
+        return records[:limit]
+    except Exception as e:
+        logger.warning("Failed to load network records from disk: %s", e)
+        return []
+
+
+def _list_available_network_files() -> List[dict]:
+    """List all available network capture files with metadata.
+
+    Returns: [{date, domain, file_path, record_count, size_bytes}, ...]
+    """
+    files = []
+    try:
+        for date_dir in sorted(_NETWORK_CACHE_DIR.iterdir(), reverse=True):
+            if not date_dir.is_dir():
+                continue
+            for file in date_dir.glob("*.jsonl"):
+                size = file.stat().st_size
+                # Count lines
+                with open(file, "r", encoding="utf-8") as f:
+                    count = sum(1 for _ in f)
+                files.append({
+                    "date": date_dir.name,
+                    "domain": file.stem,
+                    "file_path": str(file),
+                    "record_count": count,
+                    "size_bytes": size,
+                })
+    except Exception as e:
+        logger.warning("Failed to list network files: %s", e)
+    return files
+
+
+def _get_network_record_by_id(request_id: str) -> Optional[dict]:
+    """Find a specific network record by ID from disk files."""
+    try:
+        for date_dir in _NETWORK_CACHE_DIR.iterdir():
+            if not date_dir.is_dir():
+                continue
+            for file in date_dir.glob("*.jsonl"):
+                with open(file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            rec = json.loads(line)
+                            if rec.get("id") == request_id:
+                                return rec
+    except Exception as e:
+        logger.warning("Failed to find network record %s: %s", request_id, e)
+    return None
+
+
+# --- Response body storage (optional, on-demand) -------------------------
+
+def _store_response_body(request_id: str, body: bytes, task_id: str) -> Optional[str]:
+    """Store response body to disk, return file path if stored."""
+    if len(body) > _MAX_BODY_BYTES:
+        return None  # skip oversized bodies
+    bodies_dir = _NETWORK_CACHE_DIR / "bodies"
+    bodies_dir.mkdir(parents=True, exist_ok=True)
+    body_path = bodies_dir / f"{request_id}.bin"
+    try:
+        body_path.write_bytes(body)
+        return str(body_path)
+    except Exception as e:
+        logger.warning("Failed to store body for %s: %s", request_id, e)
+        return None
+
+
+def _load_response_body(request_id: str) -> Optional[str]:
+    """Load stored response body, return content as string (if text)."""
+    body_path = _NETWORK_CACHE_DIR / "bodies" / f"{request_id}.bin"
+    if not body_path.exists():
+        return None
+    try:
+        return body_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        # Try reading as bytes and decode
+        try:
+            data = body_path.read_bytes()
+            return data.decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.warning("Failed to load body for %s: %s", request_id, e)
+            return None
+
+
+def _clear_all_network_data() -> int:
+    """Clear all stored network capture data (files + bodies).
+
+    Returns number of files deleted.
+    """
+    deleted = 0
+    try:
+        for item in _NETWORK_CACHE_DIR.iterdir():
+            if item.is_dir():
+                for sub in item.iterdir():
+                    if sub.is_file():
+                        sub.unlink()
+                        deleted += 1
+                # Remove empty subdirs
+                try:
+                    item.rmdir()
+                except OSError:
+                    pass
+            elif item.is_file():
+                item.unlink()
+                deleted += 1
+    except Exception as e:
+        logger.warning("Failed to clear network data: %s", e)
+    return deleted
+
+
+# --- CDP-based Network Capture (async helpers) ---------------------------
+# Uses Chrome DevTools Protocol Network.enable to capture ALL requests,
+# including subresources (CSS, JS, images, XHR, fetch, etc.).
+# Response bodies are retrieved on-demand via Network.getResponseBody —
+# the browser itself holds the data, no need to store files ourselves.
+
+async def _async_start_network_cdp(session: dict) -> dict:
+    """Create a CDP session, enable Network domain, and register event listeners.
+
+    Returns a dict with the CDP session object and event registration status.
+    """
+    context = session.get("context")
+    page = session.get("page")
+    if not context or not page:
+        raise RuntimeError("Browser session missing context/page")
+
+    cdp = await context.new_cdp_session(page)
+    session["cdp_session"] = cdp
+
+    # Enable Network domain with reasonable buffer sizes
+    await cdp.send("Network.enable", {
+        "maxTotalBufferSize": 1000000,
+        "maxResourceBufferSize": 500000,
+        "maxPostDataSize": 65536,
+    })
+
+    # Register CDP event listeners — they populate session["network_records"]
+    def _on_request_will_be_sent(evt):
+        if not session.get("network_enabled", False):
+            return
+        try:
+            request = evt.get("request", {})
+            rec = {
+                "id": evt.get("requestId", ""),
+                "url": request.get("url", ""),
+                "method": request.get("method", "GET"),
+                "request_headers": request.get("headers", {}),
+                "resource_type": evt.get("type", "Other"),
+                "timestamp": evt.get("timestamp", time.time()),
+                "wall_time": evt.get("wallTime", time.time()),
+                "post_data": request.get("postData", None),
+                "has_post_data": request.get("hasPostData", False),
+                # Response fields filled later by responseReceived
+                "status": None,
+                "status_text": None,
+                "response_headers": None,
+                "mime_type": None,
+                "body_available": False,
+                "body_size": None,
+                "error": None,
+            }
+            lock = session.get("network_lock")
+            if lock:
+                with lock:
+                    session["network_records"].append(rec)
+            else:
+                session["network_records"].append(rec)
+        except Exception as e:
+            logger.debug("CDP Network.requestWillBeSent error: %s", e)
+
+    def _on_response_received(evt):
+        if not session.get("network_enabled", False):
+            return
+        try:
+            resp = evt.get("response", {})
+            req_id = evt.get("requestId", "")
+            # Find matching request record and update it
+            lock = session.get("network_lock")
+            records = session.get("network_records", [])
+            if lock:
+                with lock:
+                    for rec in records:
+                        if rec.get("id") == req_id:
+                            rec["status"] = resp.get("status")
+                            rec["status_text"] = resp.get("statusText", "")
+                            rec["response_headers"] = resp.get("headers", {})
+                            rec["mime_type"] = resp.get("mimeType", "")
+                            rec["body_available"] = True
+                            rec["body_size"] = resp.get("bodySize", None)
+                            break
+            else:
+                for rec in records:
+                    if rec.get("id") == req_id:
+                        rec["status"] = resp.get("status")
+                        rec["status_text"] = resp.get("statusText", "")
+                        rec["response_headers"] = resp.get("headers", {})
+                        rec["mime_type"] = resp.get("mimeType", "")
+                        rec["body_available"] = True
+                        rec["body_size"] = resp.get("bodySize", None)
+                        break
+        except Exception as e:
+            logger.debug("CDP Network.responseReceived error: %s", e)
+
+    def _on_loading_finished(evt):
+        if not session.get("network_enabled", False):
+            return
+        try:
+            req_id = evt.get("requestId", "")
+            lock = session.get("network_lock")
+            records = session.get("network_records", [])
+            if lock:
+                with lock:
+                    for rec in records:
+                        if rec.get("id") == req_id:
+                            rec["body_available"] = True
+                            break
+            else:
+                for rec in records:
+                    if rec.get("id") == req_id:
+                        rec["body_available"] = True
+                        break
+        except Exception as e:
+            logger.debug("CDP Network.loadingFinished error: %s", e)
+
+    def _on_request_failed(evt):
+        if not session.get("network_enabled", False):
+            return
+        try:
+            req_id = evt.get("requestId", "")
+            lock = session.get("network_lock")
+            records = session.get("network_records", [])
+            if lock:
+                with lock:
+                    for rec in records:
+                        if rec.get("id") == req_id:
+                            rec["status"] = 0
+                            rec["status_text"] = "FAILED"
+                            rec["error"] = evt.get("errorText", "Request failed")
+                            rec["body_available"] = False
+                            break
+            else:
+                for rec in records:
+                    if rec.get("id") == req_id:
+                        rec["status"] = 0
+                        rec["status_text"] = "FAILED"
+                        rec["error"] = evt.get("errorText", "Request failed")
+                        rec["body_available"] = False
+                        break
+        except Exception as e:
+            logger.debug("CDP Network.requestFailed error: %s", e)
+
+    cdp.on("Network.requestWillBeSent", _on_request_will_be_sent)
+    cdp.on("Network.responseReceived", _on_response_received)
+    cdp.on("Network.loadingFinished", _on_loading_finished)
+    cdp.on("Network.requestFailed", _on_request_failed)
+
+    return {"cdp": cdp, "enabled": True}
+
+
+async def _async_stop_network_cdp(session: dict) -> None:
+    """Disable Network domain and detach the CDP session."""
+    cdp = session.get("cdp_session")
+    if cdp:
+        try:
+            await cdp.send("Network.disable")
+        except Exception:
+            pass
+        try:
+            await cdp.detach()
+        except Exception:
+            pass
+        session["cdp_session"] = None
+
+
+async def _async_get_response_body(session: dict, request_id: str) -> Optional[str]:
+    """Retrieve response body from browser via CDP Network.getResponseBody.
+
+    Returns the body content as a string, or None if unavailable.
+    """
+    cdp = session.get("cdp_session")
+    if not cdp:
+        return None
+    try:
+        result = await cdp.send("Network.getResponseBody", {"requestId": request_id})
+        body = result.get("body", "")
+        base64 = result.get("base64Encoded", False)
+        if base64 and body:
+            # Decode base64 body
+            import base64 as b64mod
+            return b64mod.b64decode(body).decode("utf-8", errors="replace")
+        return body
+    except Exception as e:
+        logger.debug("CDP getResponseBody error for %s: %s", request_id, e)
+        return None
+
+
+# --- Public: cloakbrowser_network tool -----------------------------------
+
+def cloakbrowser_network(
+    action: str,
+    domain: Optional[str] = None,
+    method: Optional[str] = None,
+    status: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    request_id: Optional[str] = None,
+    include_body: bool = False,
+    limit: int = 50,
+    task_id: Optional[str] = None,
+) -> str:
+    """Network capture tool for CloakBrowser.
+
+    Actions:
+      - "start": Enable network capture for this session
+      - "stop": Disable capture and flush records to disk
+      - "flush": Flush in-memory records to disk (capture continues)
+      - "list": List captured records (memory + disk), filtered
+      - "get": Get full details of a specific request by ID
+      - "stats": Summary statistics of captured data
+      - "files": List available network capture files by domain/date
+      - "clear": Delete all stored network data
+
+    Filters (for "list" action):
+      - domain: Filter by domain (e.g., "google.com")
+      - method: Filter by HTTP method (GET, POST, etc.)
+      - status: Filter by status category ("2xx", "3xx", "4xx", "5xx", "failed")
+      - resource_type: Filter by type (document, script, stylesheet, image, xhr, fetch)
+      - limit: Max records to return (default 50)
+    """
+    try:
+        tid = task_id or "default"
+        action = action.lower().strip()
+
+        # --- start: enable CDP-based capture ----------------------------
+        if action == "start":
+            session = _get_session(tid)
+            session["network_enabled"] = True
+            session["network_records"] = session.get("network_records", [])
+            session["network_lock"] = session.get("network_lock") or threading.Lock()
+            # Create CDP session and enable Network domain
+            _run_session_coro(tid, _async_start_network_cdp(session))
+            cdp_active = session.get("cdp_session") is not None
+            return json.dumps({
+                "success": True,
+                "message": f"Network capture enabled for session '{tid}' via CDP",
+                "backend": "cloakbrowser",
+                "cdp_active": cdp_active,
+            })
+
+        # --- stop: disable CDP capture -----------------------------------
+        elif action == "stop":
+            with _sessions_lock:
+                session = _sessions.get(tid)
+            if not session:
+                return json.dumps({"success": True, "message": "No session to stop"})
+            session["network_enabled"] = False
+            # Optionally flush remaining records to disk for persistence
+            records = session.get("network_records", [])
+            flushed = _flush_network_records_to_disk(records, tid)
+            session["network_records"] = []
+            # Disable CDP Network domain and detach session
+            _run_session_coro(tid, _async_stop_network_cdp(session))
+            return json.dumps({
+                "success": True,
+                "message": f"Network capture disabled. Flushed {flushed} records to disk.",
+                "flushed_count": flushed,
+                "cdp_detached": True,
+            })
+
+        # --- flush: write to disk but keep capturing ----------------------
+        elif action == "flush":
+            with _sessions_lock:
+                session = _sessions.get(tid)
+            if not session:
+                return json.dumps({"success": False, "error": "No active session"})
+            records = session.get("network_records", [])
+            flushed = _flush_network_records_to_disk(records, tid)
+            session["network_records"] = []
+            return json.dumps({
+                "success": True,
+                "message": f"Flushed {flushed} records to disk. Capture continues.",
+                "flushed_count": flushed,
+            })
+
+        # --- list: query records -----------------------------------------
+        elif action == "list":
+            # Combine in-memory + disk records
+            all_records = []
+            with _sessions_lock:
+                session = _sessions.get(tid)
+            if session:
+                all_records.extend(session.get("network_records", []))
+            # Load from disk with filters
+            disk_records = _load_network_records_from_disk(
+                domain_filter=domain,
+                date_filter=None,  # all dates
+                limit=limit * 2,   # allow room for filtering
+            )
+            all_records.extend(disk_records)
+            # Apply filters
+            filtered = []
+            for rec in all_records:
+                if domain and _network_domain_from_url(rec.get("url", "")) != domain:
+                    continue
+                if method and rec.get("method", "").upper() != method.upper():
+                    continue
+                if status:
+                    st = rec.get("status", 0)
+                    st_cat = "failed" if st == 0 else f"{st // 100}xx"
+                    if st_cat != status.lower():
+                        continue
+                if resource_type and rec.get("resource_type") != resource_type:
+                    continue
+                filtered.append(rec)
+            # Sort by timestamp descending, apply limit
+            filtered.sort(key=lambda r: r.get("timestamp", 0), reverse=True)
+            result = filtered[:limit]
+            # Compact output: only key fields for list view
+            compact = [
+                {
+                    "id": r.get("id"),
+                    "url": r.get("url", "")[:120],
+                    "method": r.get("method"),
+                    "status": r.get("status"),
+                    "resource_type": r.get("resource_type"),
+                    "timestamp": r.get("timestamp"),
+                }
+                for r in result
+            ]
+            return json.dumps({
+                "success": True,
+                "count": len(compact),
+                "total_available": len(filtered),
+                "records": compact,
+            })
+
+        # --- get: full details of one request ----------------------------
+        elif action == "get":
+            if not request_id:
+                return json.dumps({"success": False, "error": "request_id required for 'get' action"})
+            # Find in memory
+            rec = None
+            with _sessions_lock:
+                session = _sessions.get(tid)
+            if session:
+                for r in session.get("network_records", []):
+                    if r.get("id") == request_id:
+                        rec = r
+                        break
+            # Find on disk
+            if not rec:
+                rec = _get_network_record_by_id(request_id)
+            if not rec:
+                return json.dumps({"success": False, "error": f"Request ID '{request_id}' not found"})
+            # Optionally load body via CDP (on-demand, browser itself holds the data)
+            if include_body and rec.get("body_available") and session and session.get("cdp_session"):
+                body = _run_session_coro(tid, _async_get_response_body(session, request_id))
+                rec["body"] = body[:5000] if body else None  # truncate for LLM context
+            elif include_body:
+                rec["body"] = None  # Body not available (not loaded yet or CDP not active)
+            return json.dumps({"success": True, "record": rec})
+
+        # --- stats: summary ----------------------------------------------
+        elif action == "stats":
+            stats = {"in_memory": 0, "on_disk": 0, "domains": [], "dates": [], "methods": {}, "statuses": {}}
+            with _sessions_lock:
+                session = _sessions.get(tid)
+            if session:
+                stats["in_memory"] = len(session.get("network_records", []))
+                stats["capture_enabled"] = session.get("network_enabled", False)
+                # Include in-memory records in method/status distribution
+                for r in session.get("network_records", []):
+                    m = r.get("method", "UNKNOWN")
+                    stats["methods"][m] = stats["methods"].get(m, 0) + 1
+                    st = r.get("status", 0)
+                    st_cat = "failed" if st == 0 else f"{st // 100}xx"
+                    stats["statuses"][st_cat] = stats["statuses"].get(st_cat, 0) + 1
+            # Disk stats
+            files = _list_available_network_files()
+            stats["files"] = len(files)
+            stats["on_disk"] = sum(f.get("record_count", 0) for f in files)
+            stats["domains"] = sorted([d for d in set(f.get("domain") for f in files) if d])
+            stats["dates"] = sorted([d for d in set(f.get("date") for f in files) if d], reverse=True)
+            # Method/status distribution from disk sample (add to in-memory counts)
+            sample = _load_network_records_from_disk(limit=200)
+            for r in sample:
+                m = r.get("method", "UNKNOWN")
+                stats["methods"][m] = stats["methods"].get(m, 0) + 1
+                st = r.get("status", 0)
+                st_cat = "failed" if st == 0 else f"{st // 100}xx"
+                stats["statuses"][st_cat] = stats["statuses"].get(st_cat, 0) + 1
+            return json.dumps({"success": True, "stats": stats})
+
+        # --- files: list available capture files -------------------------
+        elif action == "files":
+            files = _list_available_network_files()
+            return json.dumps({
+                "success": True,
+                "count": len(files),
+                "files": files,
+                "network_dir": str(_NETWORK_CACHE_DIR),
+            })
+
+        # --- clear: delete all data --------------------------------------
+        elif action == "clear":
+            deleted = _clear_all_network_data()
+            # Also clear in-memory
+            with _sessions_lock:
+                session = _sessions.get(tid)
+            if session:
+                session["network_records"] = []
+            return json.dumps({
+                "success": True,
+                "message": f"Deleted {deleted} network capture files",
+                "deleted_files": deleted,
+            })
+
+        else:
+            return json.dumps({
+                "success": False,
+                "error": f"Unknown action '{action}'. Valid: start, stop, flush, list, get, stats, files, clear",
+            })
+
+    except Exception as e:
+        return _tool_error(f"Network capture error: {e}")
 
 
 # ---------------------------------------------------------------------------
