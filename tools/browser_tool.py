@@ -1643,6 +1643,51 @@ BROWSER_TOOL_SCHEMAS = [
             "required": ["x", "y"]
         }
     },
+    {
+        "name": "browser_network",
+        "description": "Network capture tool for CloakBrowser (CLOAKBROWSER_MODE=true). Uses Chrome DevTools Protocol (CDP) Network.enable to capture ALL requests including subresources (CSS/JS/images/XHR/fetch). Response bodies fetched ON-DEMAND via CDP Network.getResponseBody — browser itself holds data, no files needed. Optional disk persistence via flush action for cross-session storage. Actions: start (CDP enable), stop (CDP disable), flush (disk), list (query), get (details+body), stats, files, clear. Filters: domain, method, status (2xx/3xx/4xx/5xx/failed), resource_type (document/script/image/xhr/etc), limit.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["start", "stop", "flush", "list", "get", "stats", "files", "clear"],
+                    "description": "Action to perform on the network capture system. 'start': enable capture, 'stop': disable+flush, 'flush': write to disk, 'list': query records, 'get': full details by request_id, 'stats': summary statistics, 'files': list storage files, 'clear': delete all data."
+                },
+                "domain": {
+                    "type": "string",
+                    "description": "Filter records by domain (e.g., 'google.com'). Only for 'list' action."
+                },
+                "method": {
+                    "type": "string",
+                    "description": "Filter records by HTTP method (GET, POST, PUT, DELETE, etc.). Only for 'list' action."
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Filter records by status category: '2xx', '3xx', '4xx', '5xx', or 'failed' (status code 0). Only for 'list' action."
+                },
+                "resource_type": {
+                    "type": "string",
+                    "description": "Filter records by resource type: document, script, stylesheet, image, font, xhr, fetch, websocket, other. Only for 'list' action."
+                },
+                "request_id": {
+                    "type": "string",
+                    "description": "Request ID to fetch full details for. Required for 'get' action."
+                },
+                "include_body": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "If true and request_id is provided, fetch and include response body via CDP Network.getResponseBody. Bodies are fetched ON-DEMAND directly from the browser — no files need to be stored. Only for 'get' action."
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 50,
+                    "description": "Maximum number of records to return. Default 50. Only for 'list' action."
+                }
+            },
+            "required": ["action"]
+        }
+    },
 ]
 
 
@@ -2872,6 +2917,62 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     return json.dumps(response, ensure_ascii=False)
 
 
+def browser_network(
+    action: str,
+    domain: Optional[str] = None,
+    method: Optional[str] = None,
+    status: Optional[str] = None,
+    resource_type: Optional[str] = None,
+    request_id: Optional[str] = None,
+    include_body: bool = False,
+    limit: int = 50,
+    task_id: Optional[str] = None,
+) -> str:
+    """Network capture tool for browser automation via CloakBrowser.
+
+    Lazy, on-demand request/response recording via Playwright events.
+    Data stored to ~/.cloakbrowser/network/ organized by domain+date.
+    Response bodies not stored by default (fetch on-demand via include_body=True).
+
+    Actions:
+      - start: Enable network capture for this session
+      - stop: Disable capture and flush records to disk
+      - flush: Write in-memory records to disk (capture continues)
+      - list: Query/filter captured records
+      - get: Get full details of a specific request by ID
+      - stats: Summary statistics of captured data
+      - files: List available network capture files
+      - clear: Delete all stored network data
+
+    Filters (for 'list' action):
+      - domain: Filter by domain (e.g., 'google.com')
+      - method: Filter by HTTP method (GET, POST, etc.)
+      - status: Filter by status category ('2xx', '3xx', '4xx', '5xx', 'failed')
+      - resource_type: Filter by type (document, script, stylesheet, image, xhr, fetch)
+      - limit: Max records to return (default 50)
+    """
+    if _is_cloakbrowser_mode():
+        from tools.browser_cloakbrowser import cloakbrowser_network
+        return cloakbrowser_network(
+            action=action,
+            domain=domain,
+            method=method,
+            status=status,
+            resource_type=resource_type,
+            request_id=request_id,
+            include_body=include_body,
+            limit=limit,
+            task_id=task_id,
+        )
+
+    # Network capture only supported in CloakBrowser mode
+    return json.dumps({
+        "success": False,
+        "error": "Network capture is only available when CloakBrowser mode is enabled (CLOAKBROWSER_MODE=true). "
+                 "This feature requires Playwright's response/request event handling."
+    })
+
+
 def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate a JavaScript expression in the page context and return the result."""
     if _is_camofox_mode():
@@ -3932,4 +4033,23 @@ registry.register(
     handler=lambda args, **kw: browser_click_at(x=args.get("x", 0), y=args.get("y", 0), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🎯",
+)
+
+registry.register(
+    name="browser_network",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_network"],
+    handler=lambda args, **kw: browser_network(
+        action=args.get("action", "stats"),
+        domain=args.get("domain"),
+        method=args.get("method"),
+        status=args.get("status"),
+        resource_type=args.get("resource_type"),
+        request_id=args.get("request_id"),
+        include_body=args.get("include_body", False),
+        limit=args.get("limit", 50),
+        task_id=kw.get("task_id"),
+    ),
+    check_fn=check_browser_requirements,
+    emoji="🌐",
 )
