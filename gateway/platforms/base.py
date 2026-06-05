@@ -3275,6 +3275,13 @@ class BasePlatformAdapter(ABC):
         doesn't override :meth:`delete_message` so non-supporting
         platforms silently degrade to normal sends.
         """
+        # Defensive: handle unexpected None or non-tuple returns from edge cases
+        if response is None:
+            return "", 0
+        if not isinstance(response, (str, type(None), EphemeralReply)):
+            # Unexpected type - convert to string safely
+            return str(response), 0
+        
         if isinstance(response, EphemeralReply):
             ttl = response.ttl_seconds
             if ttl is None:
@@ -3285,7 +3292,157 @@ class BasePlatformAdapter(ABC):
             if ttl and ttl > 0 and type(self).delete_message is BasePlatformAdapter.delete_message:
                 ttl = 0
             return response.text, int(ttl or 0)
+        
+        # Handle plain string or None response
         return response, 0
+
+    async def _send_response_with_media_attachments(
+        self,
+        chat_id: str,
+        text: str,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+        ephemeral_ttl: int = 0,
+    ) -> Optional[SendResult]:
+        """Send a response text after extracting MEDIA: tags and other media.
+
+        This is the shared helper used by bypass handlers and clarify
+        text-intercept.  Mirrors the chained extraction pipeline in
+        ``gateway/run.py`` — extract_media → extract_images →
+        extract_local_files — plus the safety filters
+        ``filter_media_delivery_paths`` / ``filter_local_delivery_paths``
+        so non-producer-tool paths are never dispatched as attachments.
+
+        Returns the ``SendResult`` from the text send (for ephemeral
+        scheduling), or ``None`` if no text was left after extraction.
+        """
+        from pathlib import Path
+        from urllib.parse import quote as _quote
+
+        if not text:
+            return None
+
+        # Capture [[as_document]] before extract_media strips it, so the
+        # dispatch partition below can route image-extension files
+        # through send_document (preserving bytes) instead of
+        # send_multiple_images (Telegram sendPhoto recompresses to ~1280px).
+        force_document_attachments = "[[as_document]]" in text
+
+        # Chain: extract_media → extract_images → extract_local_files
+        # (matches gateway/run.py order so MEDIA: tags and image URLs
+        # are removed before bare-path auto-detect runs.)
+        media_files, cleaned = self.extract_media(text)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        _, cleaned = self.extract_images(cleaned)
+        local_files, cleaned = self.extract_local_files(cleaned)
+        local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+
+        # Send the text portion
+        result = None
+        if cleaned.strip():
+            result = await self._send_with_retry(
+                chat_id=chat_id,
+                content=cleaned.strip(),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            # Schedule ephemeral auto-deletion if applicable
+            if ephemeral_ttl > 0 and result.success and result.message_id:
+                self._schedule_ephemeral_delete(
+                    chat_id=chat_id,
+                    message_id=result.message_id,
+                    ttl_seconds=ephemeral_ttl,
+                )
+
+        # Human-like pacing between text and media
+        human_delay = self._get_human_delay()
+
+        # Partition out images so they can be sent as a single batch
+        # When [[as_document]] was set, image-extension files skip the
+        # photo path and route to send_document below.
+        _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
+        _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+
+        image_paths: list = []
+        non_image_media: list = []
+        for media_path, is_voice in media_files:
+            ext = Path(media_path).suffix.lower()
+            if (ext in _IMAGE_EXTS
+                    and not is_voice
+                    and not force_document_attachments):
+                image_paths.append(media_path)
+            else:
+                non_image_media.append((media_path, is_voice))
+
+        non_image_local: list = []
+        for file_path in local_files:
+            if (Path(file_path).suffix.lower() in _IMAGE_EXTS
+                    and not force_document_attachments):
+                image_paths.append(file_path)
+            else:
+                non_image_local.append(file_path)
+
+        if image_paths:
+            try:
+                images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                await self.send_multiple_images(
+                    chat_id=chat_id,
+                    images=images,
+                    metadata=metadata,
+                    human_delay=human_delay,
+                )
+            except Exception as batch_err:
+                logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+
+        # Send non-image media (video, audio, document)
+        for media_path, is_voice in non_image_media:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            try:
+                ext = Path(media_path).suffix.lower()
+                if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
+                    await self.send_voice(
+                        chat_id=chat_id,
+                        audio_path=media_path,
+                        metadata=metadata,
+                    )
+                elif ext in _VIDEO_EXTS:
+                    await self.send_video(
+                        chat_id=chat_id,
+                        video_path=media_path,
+                        metadata=metadata,
+                    )
+                else:
+                    await self.send_document(
+                        chat_id=chat_id,
+                        file_path=media_path,
+                        metadata=metadata,
+                    )
+            except Exception as media_err:
+                logger.warning("[%s] Error sending media: %s", self.name, media_err)
+
+        # Send auto-detected local non-image files
+        for file_path in non_image_local:
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            try:
+                ext = Path(file_path).suffix.lower()
+                if ext in _VIDEO_EXTS:
+                    await self.send_video(
+                        chat_id=chat_id,
+                        video_path=file_path,
+                        metadata=metadata,
+                    )
+                else:
+                    await self.send_document(
+                        chat_id=chat_id,
+                        file_path=file_path,
+                        metadata=metadata,
+                    )
+            except Exception as file_err:
+                logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+
+        return result
 
     async def _send_with_retry(
         self,
@@ -3865,18 +4022,13 @@ class BasePlatformAdapter(ABC):
                     response = await self._message_handler(event)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
                     if _text:
-                        _r = await self._send_with_retry(
+                        await self._send_response_with_media_attachments(
                             chat_id=event.source.chat_id,
-                            content=_text,
+                            text=_text,
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_thread_meta,
+                            ephemeral_ttl=_eph_ttl,
                         )
-                        if _eph_ttl > 0 and _r.success and _r.message_id:
-                            self._schedule_ephemeral_delete(
-                                chat_id=event.source.chat_id,
-                                message_id=_r.message_id,
-                                ttl_seconds=_eph_ttl,
-                            )
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
@@ -3915,18 +4067,13 @@ class BasePlatformAdapter(ABC):
                         response = await self._message_handler(event)
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
                         if _text:
-                            _r = await self._send_with_retry(
+                            await self._send_response_with_media_attachments(
                                 chat_id=event.source.chat_id,
-                                content=_text,
+                                text=_text,
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_thread_meta,
+                                ephemeral_ttl=_eph_ttl,
                             )
-                            if _eph_ttl > 0 and _r.success and _r.message_id:
-                                self._schedule_ephemeral_delete(
-                                    chat_id=event.source.chat_id,
-                                    message_id=_r.message_id,
-                                    ttl_seconds=_eph_ttl,
-                                )
                     except Exception as e:
                         logger.error(
                             "[%s] Clarify text-intercept dispatch failed: %s",
