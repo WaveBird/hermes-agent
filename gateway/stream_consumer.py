@@ -182,6 +182,8 @@ class GatewayStreamConsumer:
         # first failure we permanently disable drafts for the remainder of
         # this response and route through edit-based for graceful degradation.
         self._draft_failures = 0
+        # Feishu CardKit streaming card support
+        self._uses_streaming_card = getattr(adapter, "streaming_cards_enabled", False) is True
 
     @property
     def already_sent(self) -> bool:
@@ -518,10 +520,14 @@ class GatewayStreamConsumer:
 
                     # Existing message: edit it with the first chunk, then
                     # start a new message for the overflow remainder.
+                    # Streaming cards (Feishu CardKit) handle content updates as
+                    # full-text diffs server-side, so they don't need chunked
+                    # overflow splitting — the entire content is sent each time.
                     while (
                         _len_fn(self._accumulated) > _safe_limit
                         and self._message_id is not None
                         and self._edit_supported
+                        and not self._uses_streaming_card
                     ):
                         _cp_budget = _custom_unit_to_cp(
                             self._accumulated, _safe_limit, _len_fn,
@@ -551,11 +557,19 @@ class GatewayStreamConsumer:
                             # continuation without dropping content.
                             break
                         self._accumulated = self._accumulated[split_at:].lstrip("\n")
-                        self._message_id = None
-                        self._last_sent_text = ""
+                        # For streaming cards (Feishu CardKit), the content
+                        # update API takes the full accumulated text and diffs
+                        # it server-side, so overflow splitting is unnecessary
+                        # and counterproductive — it would kill the card and
+                        # create a new one for each chunk.  Skip the reset.
+                        if not self._uses_streaming_card:
+                            # Stop the current streaming card before starting a new one
+                            await self._stop_streaming_card_if_active()
+                            self._message_id = None
+                            self._last_sent_text = ""
 
                     display_text = self._accumulated
-                    if not got_done and not got_segment_break and commentary_text is None:
+                    if not got_done and not got_segment_break and commentary_text is None and not self._uses_streaming_card:
                         display_text += self.cfg.cursor
 
                     # Segment break: finalize the current message so platforms
@@ -1319,12 +1333,20 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=text,
-                    reply_to=self._initial_reply_to_id,
-                    metadata=self.metadata,
-                )
+                if self._uses_streaming_card:
+                    result = await self.adapter.send_streaming_card(
+                        chat_id=self.chat_id,
+                        content=text,
+                        reply_to=self._initial_reply_to_id,
+                        metadata=self.metadata,
+                    )
+                else:
+                    result = await self.adapter.send(
+                        chat_id=self.chat_id,
+                        content=text,
+                        reply_to=self._initial_reply_to_id,
+                        metadata=self.metadata,
+                    )
                 if result.success:
                     if result.message_id:
                         self._message_id = result.message_id
@@ -1356,3 +1378,10 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.error("Stream send/edit error: %s", e)
             return False
+
+    async def _stop_streaming_card_if_active(self) -> None:
+        """Stop the streaming card if the adapter supports it and one is active."""
+        if self._uses_streaming_card and self._message_id is not None:
+            stop_fn = getattr(self.adapter, "stop_streaming_card", None)
+            if stop_fn is not None:
+                await stop_fn(self._message_id)

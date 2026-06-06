@@ -113,27 +113,6 @@ try:
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
     from lark_oapi.ws import Client as FeishuWSClient
 
-    # CardKit imports are separated so that an older lark_oapi without cardkit.v1
-    # doesn't break the entire Feishu adapter — only streaming cards are disabled.
-    try:
-        from lark_oapi.api.cardkit.v1 import (
-            CreateCardRequest,
-            CreateCardRequestBody,
-            ContentCardElementRequest,
-            ContentCardElementRequestBody,
-            SettingsCardRequest,
-            SettingsCardRequestBody,
-        )
-        FEISHU_CARDKIT_AVAILABLE = True
-    except ImportError:
-        FEISHU_CARDKIT_AVAILABLE = False
-        CreateCardRequest = None  # type: ignore[assignment]
-        CreateCardRequestBody = None  # type: ignore[assignment]
-        ContentCardElementRequest = None  # type: ignore[assignment]
-        ContentCardElementRequestBody = None  # type: ignore[assignment]
-        SettingsCardRequest = None  # type: ignore[assignment]
-        SettingsCardRequestBody = None  # type: ignore[assignment]
-
     FEISHU_AVAILABLE = True
 except ImportError:
     FEISHU_AVAILABLE = False
@@ -143,7 +122,28 @@ except ImportError:
     EventDispatcherHandler = None  # type: ignore[assignment]
     FeishuWSClient = None  # type: ignore[assignment]
     FEISHU_DOMAIN = None  # type: ignore[assignment]
-    LARK_DOMAIN = None  # type: ignore[assignment]
+
+# CardKit imports are separated so that an older lark_oapi without cardkit.v1
+# doesn't break the entire Feishu adapter — only streaming cards are disabled.
+try:
+    from lark_oapi.api.cardkit.v1 import (
+        CreateCardRequest,
+        CreateCardRequestBody,
+        ContentCardElementRequest,
+        ContentCardElementRequestBody,
+        SettingsCardRequest,
+        SettingsCardRequestBody,
+    )
+
+    FEISHU_CARDKIT_AVAILABLE = True
+except ImportError:
+    FEISHU_CARDKIT_AVAILABLE = False
+    CreateCardRequest = None  # type: ignore[assignment]
+    CreateCardRequestBody = None  # type: ignore[assignment]
+    ContentCardElementRequest = None  # type: ignore[assignment]
+    ContentCardElementRequestBody = None  # type: ignore[assignment]
+    SettingsCardRequest = None  # type: ignore[assignment]
+    SettingsCardRequestBody = None  # type: ignore[assignment]
 
 FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
@@ -1886,14 +1886,13 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        content = self.format_message(content)
         # --- CardKit streaming card path ---
         sc = self._streaming_cards.get(message_id)
         if sc is not None:
             return await self._update_streaming_card_content(sc, content)
 
         # --- Regular IM update path ---
-
-        content = self.format_message(content)
         try:
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
