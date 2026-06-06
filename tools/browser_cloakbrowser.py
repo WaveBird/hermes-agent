@@ -149,20 +149,35 @@ async def _async_get_session(task_id: Optional[str], headless: bool) -> Dict[str
 
     launch_async = _import_cloakbrowser_launch()
 
-    # Clear proxy env vars so Chromium doesn't inherit Clash/mihomo proxy
-    # (BYD internal network doesn't need proxy; stale proxy vars cause ERR_CONNECTION_RESET)
+    # Read proxy from Hermes env vars (set via .env or hermes_proxy_on/off).
+    # Pass it to Playwright as per-context proxy so Chromium uses Clash for
+    # external sites while BYD internal traffic is handled by Clash's bypass rules.
+    # Clear proxy env vars *before* launch_async so Chromium doesn't get a
+    # blanket env-level proxy (which would route ALL traffic including BYD
+    # internal sites through Clash, causing ERR_CONNECTION_RESET on misconfigured
+    # Clash rules).  Playwright's per-context proxy is the correct mechanism.
     _proxy_vars = {}
-    for _k in ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy']:
+    _proxy_url = None
+    for _k in ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy', 'all_proxy']:
         _v = os.environ.get(_k)
         if _v:
             _proxy_vars[_k] = _v
+            if _proxy_url is None:
+                _proxy_url = _v  # first valid proxy wins
             del os.environ[_k]
 
     browser = await launch_async(headless=headless)
 
     # Restore proxy vars for the rest of the process
     os.environ.update(_proxy_vars)
-    context = await browser.new_context(no_viewport=True)
+
+    # Pass proxy to Playwright context level (not env level).
+    # This lets Clash's bypass rules handle BYD internal traffic correctly,
+    # while external sites go through the proxy.
+    _context_kwargs = {"no_viewport": True}
+    if _proxy_url:
+        _context_kwargs["proxy"] = {"server": _proxy_url}
+    context = await browser.new_context(**_context_kwargs)
     page = await context.new_page()
 
     # Create session dict first (so handlers can reference it)
