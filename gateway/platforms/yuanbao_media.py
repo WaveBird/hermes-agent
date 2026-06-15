@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 UPLOAD_INFO_PATH = "/api/resource/genUploadInfo"
 DEFAULT_API_DOMAIN = "yuanbao.tencent.com"
-DEFAULT_MAX_SIZE_MB = 50
+DEFAULT_MAX_SIZE_MB = 100
 
 # COS 加速域名后缀（优先使用全球加速）
 COS_USE_ACCELERATE = True
