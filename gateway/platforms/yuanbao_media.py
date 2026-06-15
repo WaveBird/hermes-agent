@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 UPLOAD_INFO_PATH = "/api/resource/genUploadInfo"
 DEFAULT_API_DOMAIN = "yuanbao.tencent.com"
-DEFAULT_MAX_SIZE_MB = 50
+DEFAULT_MAX_SIZE_MB = 100
 
 # MIME → image_format 数字（TIM 协议字段）
 _MIME_TO_IMAGE_FORMAT: dict[str, int] = {

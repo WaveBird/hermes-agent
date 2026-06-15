@@ -725,7 +725,7 @@ PLATFORM_HINTS = {
     "yuanbao": (
         "You are on Yuanbao (\u817e\u8baf\u5143\u5b9d), a Chinese AI assistant "
         "platform. Markdown renders (code blocks, tables, bold/italic). "
-        f"{_MEDIA_NATIVE}Images (.jpg, .png, .webp, .gif) send as photos, other files as downloadable documents (max 50 MB); "
+        f"{_MEDIA_NATIVE}Images (.jpg, .png, .webp, .gif) send as photos, other files as downloadable documents (max 100 MB); "
         "image URLs via ![alt](url) are downloaded and sent as photos. Never claim you lack file-sending. "
         "Stickers (\u8d34\u7eb8/\u8868\u60c5\u5305): when the user sends one (you see '[emoji: "
         "\u540d\u79f0]') or asks for one, use the sticker tools \u2014 yb_search_sticker with a Chinese "
