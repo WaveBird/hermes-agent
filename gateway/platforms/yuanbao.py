@@ -4497,8 +4497,27 @@ class MessageSender:
     # -- Chat lock ---------------------------------------------------------
 
     def get_chat_lock(self, chat_id: str) -> asyncio.Lock:
-        """Return (or create) a per-chat-id lock with safe LRU eviction."""
+        """Return (or create) a per-chat-id lock with safe LRU eviction.
+
+        On Python 3.10+, asyncio.Lock binds to the event loop it was created on.
+        If the loop changes (e.g. after a reconnect or thread switch), using a
+        stale lock raises RuntimeError.  We detect this and replace the lock so
+        the gateway recovers instead of permanently blocking outbound sends.
+        """
         if chat_id in self._chat_locks:
+            lock = self._chat_locks[chat_id]
+            # Check if the lock's bound loop matches the current running loop.
+            # If it doesn't (or no loop is running), replace it to avoid
+            # "is bound to a different event loop" RuntimeError.
+            try:
+                current_loop = asyncio.get_running_loop()
+                bound_loop = getattr(lock, "_loop", None)
+                if bound_loop is not None and bound_loop is not current_loop:
+                    # Stale lock — replace it
+                    self._chat_locks[chat_id] = asyncio.Lock()
+            except RuntimeError:
+                # No running loop (unlikely in async context, but safe fallback)
+                pass
             self._chat_locks.move_to_end(chat_id)
             return self._chat_locks[chat_id]
         if len(self._chat_locks) >= self.CHAT_DICT_MAX_SIZE:
@@ -4983,7 +5002,7 @@ class YuanbaoAdapter(BasePlatformAdapter):
 
     PLATFORM = Platform.YUANBAO
     MAX_TEXT_CHUNK: int = 4000  # Yuanbao single message character limit
-    MEDIA_MAX_SIZE_MB: int = 50  # Max media file size in MB for upload validation
+    MEDIA_MAX_SIZE_MB: int = 100  # Max media file size in MB for upload validation
     REPLY_REF_MAX_ENTRIES: ClassVar[int] = 500  # Max capacity of reference dedup dict
 
     # -- Active instance registry (class-level singleton) -------------------
