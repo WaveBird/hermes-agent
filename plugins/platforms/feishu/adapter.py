@@ -1893,7 +1893,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # --- CardKit streaming card path ---
         sc = self._streaming_cards.get(message_id)
         if sc is not None:
-            return await self._update_streaming_card_content(sc, content)
+            result = await self._update_streaming_card_content(sc, content)
+            if finalize:
+                await self.stop_streaming_card(message_id)
+            return result
 
         # --- Regular IM update path ---
         try:

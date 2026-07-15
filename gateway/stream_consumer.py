@@ -1479,6 +1479,7 @@ class GatewayStreamConsumer:
                     _prefers_fresh = self._adapter_prefers_fresh_final(text)
                     if (
                         finalize
+                        and not self._uses_streaming_card
                         and (
                             _prefers_fresh
                             or (
@@ -1497,6 +1498,11 @@ class GatewayStreamConsumer:
                         content=text,
                         finalize=finalize,
                     )
+                    # Streaming cards need explicit stop after finalize so the
+                    # card transitions out of streaming mode and the final
+                    # layout is rendered.
+                    if finalize and self._uses_streaming_card and result.success:
+                        await self._stop_streaming_card_if_active()
                     if result.success:
                         self._already_sent = True
                         # Record any continuation fragments an oversized edit
@@ -1620,15 +1626,26 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=text,
-                    reply_to=self._initial_reply_to_id,
-                    metadata=self._metadata_for_send(
-                        final=finalize,
-                        expect_edits=True,
-                    ),
-                )
+                if self._uses_streaming_card:
+                    result = await self.adapter.send_streaming_card(
+                        chat_id=self.chat_id,
+                        content=text,
+                        reply_to=self._initial_reply_to_id,
+                        metadata=self._metadata_for_send(
+                            final=finalize,
+                            expect_edits=True,
+                        ),
+                    )
+                else:
+                    result = await self.adapter.send(
+                        chat_id=self.chat_id,
+                        content=text,
+                        reply_to=self._initial_reply_to_id,
+                        metadata=self._metadata_for_send(
+                            final=finalize,
+                            expect_edits=True,
+                        ),
+                    )
                 if result.success:
                     if result.message_id:
                         self._message_id = result.message_id
