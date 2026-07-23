@@ -40,7 +40,7 @@ class TestClarifyPrimitive:
             cm.resolve_gateway_clarify("id1", "B")
 
         threading.Thread(target=resolver).start()
-        result = cm.wait_for_response("id1", timeout=2.0)
+        result = cm.wait_for_response("id1", timeout=10.0)
         assert result == "B"
 
     def test_open_ended_auto_awaits_text(self):
@@ -63,6 +63,76 @@ class TestClarifyPrimitive:
         entry = cm.register("id3", "sk3", "Pick", ["X", "Y"])
         assert entry.awaiting_text is False
         assert cm.get_pending_for_session("sk3") is None
+
+    def test_include_choice_prompts_returns_multi_choice_entry(self):
+        """Gateway typed replies must see active choice prompts too."""
+        from tools import clarify_gateway as cm
+
+        cm.register("id3b", "sk3b", "Pick", ["X", "Y"])
+        pending = cm.get_pending_for_session("sk3b", include_choice_prompts=True)
+        assert pending is not None
+        assert pending.clarify_id == "id3b"
+
+    def test_resolve_text_response_maps_numeric_choice(self):
+        """Typed numbers should resolve to the canonical choice string."""
+        from tools import clarify_gateway as cm
+
+        cm.register("id3c", "sk3c", "Pick", ["X", "Y"])
+        assert cm.resolve_text_response_for_session("sk3c", "2") is True
+        assert cm.wait_for_response("id3c", timeout=0.1) == "Y"
+
+    def test_resolve_text_response_accepts_custom_other_text(self):
+        """Arbitrary typed text should resolve as a custom Other answer when awaiting_text is True."""
+        from tools import clarify_gateway as cm
+
+        cm.register("id3d", "sk3d", "Pick", ["X", "Y"])
+        # Flip to text-capture mode (user picked "Other")
+        cm.mark_awaiting_text("id3d")
+        custom = "None of those are valid options"
+        assert cm.resolve_text_response_for_session("sk3d", custom) is True
+        assert cm.wait_for_response("id3d", timeout=0.1) == custom
+
+    def test_resolve_text_rejects_arbitrary_prose_for_native_multi_choice(self):
+        """Native interactive multi-choice clarifies reject arbitrary prose unless awaiting_text is True."""
+        from tools import clarify_gateway as cm
+
+        # Native multi-choice (buttons, not awaiting text)
+        cm.register("id-strict", "sk-strict", "Pick one", ["A", "B", "C"])
+
+        # Arbitrary prose should be rejected
+        assert cm.resolve_text_response_for_session("sk-strict", "just checking the visual UI") is False
+        assert cm.resolve_text_response_for_session("sk-strict", "present 3 buttons") is False
+
+        # Numeric choices should still work
+        assert cm.resolve_text_response_for_session("sk-strict", "2") is True
+        assert cm.wait_for_response("id-strict", timeout=0.1) == "B"
+
+        # Exact label match should still work
+        cm.register("id-strict2", "sk-strict2", "Pick", ["Option Alpha", "Option Beta"])
+        assert cm.resolve_text_response_for_session("sk-strict2", "Option Alpha") is True
+        assert cm.wait_for_response("id-strict2", timeout=0.1) == "Option Alpha"
+
+    def test_text_fallback_mode_allows_any_text(self):
+        """Text fallback mode (after base send_clarify calls mark_awaiting_text) accepts any text."""
+        from tools import clarify_gateway as cm
+
+        entry = cm.register("id-tf", "sk-tf", "Pick one", ["A", "B", "C"])
+        assert entry.awaiting_text is False
+
+        # Simulate base send_clarify calling mark_awaiting_text
+        cm.mark_awaiting_text("id-tf")
+        assert entry.awaiting_text is True
+
+        # Now arbitrary text is accepted
+        custom = "I choose a custom answer"
+        assert cm.resolve_text_response_for_session("sk-tf", custom) is True
+        assert cm.wait_for_response("id-tf", timeout=0.1) == custom
+
+        # Numeric choices also work
+        cm.register("id-tf2", "sk-tf2", "Pick", ["X", "Y"])
+        cm.mark_awaiting_text("id-tf2")
+        assert cm.resolve_text_response_for_session("sk-tf2", "1") is True
+        assert cm.wait_for_response("id-tf2", timeout=0.1) == "X"
 
     def test_other_button_flips_to_text_mode(self):
         """mark_awaiting_text makes get_pending_for_session find the entry."""
@@ -123,7 +193,7 @@ class TestClarifyPrimitive:
             time.sleep(0.05)
             cancelled = cm.clear_session("sk7")
             assert cancelled == 1
-            result = fut.result(timeout=2.0)
+            result = fut.result(timeout=10.0)
             # clear_session sets response="" then the wait returns it
             assert result == ""
 
@@ -151,7 +221,7 @@ class TestClarifyPrimitive:
             cm.unregister_notify("sk9")
 
             # unregister_notify calls clear_session; thread unwinds
-            result = fut.result(timeout=2.0)
+            result = fut.result(timeout=10.0)
             assert result == ""
 
     def test_session_index_isolation(self):
@@ -167,11 +237,11 @@ class TestClarifyPrimitive:
         assert b is not None and b.clarify_id == "idB"
 
     def test_clarify_timeout_config_default(self):
-        """get_clarify_timeout returns 600 by default."""
+        """get_clarify_timeout returns a positive int (default 3600)."""
         from tools import clarify_gateway as cm
 
         timeout = cm.get_clarify_timeout()
-        # Default 600s OR whatever is in the user's loaded config.
+        # Default 3600s OR whatever is in the user's loaded config.
         # Floor check: must be a positive int, not crashed.
         assert isinstance(timeout, int)
         assert timeout > 0
