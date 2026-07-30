@@ -17,6 +17,7 @@ TIM 消息体构建：
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -38,7 +39,7 @@ DEFAULT_API_DOMAIN = "yuanbao.tencent.com"
 DEFAULT_MAX_SIZE_MB = 100
 
 # COS 加速域名后缀（优先使用全球加速）
-COS_USE_ACCELERATE = True
+COS_USE_ACCELERATE = False
 
 # ============ 类型映射 ============
 
@@ -542,13 +543,25 @@ async def upload_to_cos(
         bucket, region, cos_key, file_size, content_type,
     )
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.put(
-            cos_url,
-            content=file_bytes,
-            headers=put_headers,
-        )
-        resp.raise_for_status()
+    async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
+        last_exc = None
+        for _attempt in range(3):
+            try:
+                resp = await client.put(
+                    cos_url,
+                    content=file_bytes,
+                    headers=put_headers,
+                )
+                resp.raise_for_status()
+                last_exc = None
+                break
+            except (httpx.RemoteProtocolError, httpx.ConnectError) as e:
+                last_exc = e
+                logger.warning("COS PUT attempt %d failed: %s", _attempt + 1, e)
+                if _attempt < 2:
+                    await asyncio.sleep(1)
+        if last_exc:
+            raise last_exc
 
     # 解析图片尺寸（仅图片类型）
     result: dict[str, Any] = {
