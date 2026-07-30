@@ -8,6 +8,8 @@ TIM 消息体：build_image_msg_body() → TIMImageElem，build_file_msg_body() 
 
 from __future__ import annotations
 
+import asyncio
+
 import hashlib
 import hmac
 import logging
@@ -277,9 +279,21 @@ async def upload_to_cos(
     )
     put_headers = {"Authorization": authorization, "Content-Type": content_type, "x-cos-security-token": session_token}
     logger.info("COS PUT: bucket=%s region=%s key=%s size=%d mime=%s", bucket, region, cos_key, file_size, content_type)
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.put(cos_url, content=file_bytes, headers=put_headers)
-        resp.raise_for_status()
+    async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
+        last_exc = None
+        for _attempt in range(3):
+            try:
+                resp = await client.put(cos_url, content=file_bytes, headers=put_headers)
+                resp.raise_for_status()
+                last_exc = None
+                break
+            except (httpx.RemoteProtocolError, httpx.ConnectError) as e:
+                last_exc = e
+                logger.warning("COS PUT attempt %d failed: %s", _attempt + 1, e)
+                if _attempt < 2:
+                    await asyncio.sleep(1)
+        if last_exc:
+            raise last_exc
     result: dict[str, Any] = {"url": credentials.get("resourceUrl", "") or cos_url, "uuid": md5_hex(file_bytes), "size": file_size}
     if content_type.startswith("image/"):
         result.update(parse_image_size(file_bytes) or {})
@@ -324,5 +338,5 @@ def _basename_from_url(url: str) -> str:
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
 # The whole block is removed by reverting the commit that added it.
 
-COS_USE_ACCELERATE = True
+COS_USE_ACCELERATE = False
 # ---- END PLUGIN-COMPAT ----
