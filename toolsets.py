@@ -42,6 +42,7 @@ _HA_TOOLS = ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_se
 _FEISHU_TOOLS = [
     "feishu_doc_read", "feishu_drive_list_comments", "feishu_drive_list_comment_replies",
     "feishu_drive_reply_comment", "feishu_drive_add_comment",
+    "feishu_drive_search_docs",
 ]
 _YUANBAO_TOOLS = ["yb_query_group_info", "yb_query_group_members", "yb_send_dm", "yb_search_sticker", "yb_send_sticker"]
 
@@ -155,7 +156,7 @@ TOOLSETS = {
     "discord_admin": _ts("Discord server management (list channels/roles, pin messages, assign roles)", ["discord_admin"]),
     "yuanbao": _ts("Yuanbao platform tools - group info, member queries, DM, stickers", _YUANBAO_TOOLS),
     "feishu_doc": _ts("Read Feishu/Lark document content", ["feishu_doc_read"]),
-    "feishu_drive": _ts("Feishu/Lark document comment operations (list, reply, add)", _FEISHU_TOOLS[1:]),
+    "feishu_drive": _ts("Feishu/Lark document comment operations (list, reply, add) and document search", _FEISHU_TOOLS[1:]),
     "spotify": _ts(
         "Native Spotify playback, search, playlist, album, and library tools",
         ["spotify_playback", "spotify_devices", "spotify_queue", "spotify_search",

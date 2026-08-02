@@ -45,7 +45,7 @@ _POLISHED_TOOLS = {
     "cronjob", "send_message", "clarify", "discord", "discord_admin",
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     "feishu_doc_read", "feishu_drive_list_comments", "feishu_drive_list_comment_replies",
-    "feishu_drive_reply_comment", "feishu_drive_add_comment",
+    "feishu_drive_reply_comment", "feishu_drive_add_comment", "feishu_drive_search_docs",
     "kanban_create", "kanban_show", "kanban_comment", "kanban_complete",
     "kanban_block", "kanban_request_review", "kanban_request_changes",
     "kanban_link", "kanban_heartbeat",

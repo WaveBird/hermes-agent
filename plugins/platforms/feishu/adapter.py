@@ -1395,6 +1395,32 @@ class FeishuAdapter(BasePlatformAdapter):
         except TypeError:
             executor.shutdown(wait=False)
 
+
+    def _inject_module_client(self) -> None:
+        """Inject the lark client into feishu tool modules.
+
+        Makes the client available to feishu_doc_tool and feishu_drive_tool
+        via their module-level ``set_module_client()`` so that feishu tools
+        work in the main gateway agent, not just in the comment-agent context.
+        """
+        try:
+            from tools.feishu_doc_tool import set_module_client as set_doc
+            from tools.feishu_drive_tool import set_module_client as set_drive
+            set_doc(self._client)
+            set_drive(self._client)
+        except Exception:
+            pass
+
+    def _release_module_client(self) -> None:
+        """Release the module-level lark client on disconnect."""
+        try:
+            from tools.feishu_doc_tool import set_module_client as set_doc
+            from tools.feishu_drive_tool import set_module_client as set_drive
+            set_doc(None)
+            set_drive(None)
+        except Exception:
+            pass
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Feishu/Lark."""
         self._sdk_executor_closing = False  # re-arm the SDK executor after a prior disconnect
@@ -1449,6 +1475,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
+        self._release_module_client()
         self._running = False
         if self._ws_supervisor is not None:
             self._ws_supervisor.cancel()
@@ -3736,6 +3763,7 @@ class FeishuAdapter(BasePlatformAdapter):
         """Build the lark client + event dispatcher for this adapter's domain; returns the SDK domain."""
         domain = _sdk_domain(self._domain_name)
         self._client = self._build_lark_client(domain)
+        self._inject_module_client()
         self._event_handler = self._build_event_handler()
         if self._event_handler is None:
             raise RuntimeError("failed to build Feishu event handler")
