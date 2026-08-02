@@ -1,4 +1,4 @@
-"""Tests for feishu_doc_tool and feishu_drive_tool — registration and schema validation."""
+"""Tests for feishu_doc_tool and feishu_drive_tool — registration, schema, and URL parsing."""
 
 import importlib
 import unittest
@@ -49,6 +49,61 @@ class TestFeishuToolRegistration(unittest.TestCase):
         self.assertIn("page_size", props, "search_docs missing page_size param")
         required = entry.schema["parameters"].get("required", [])
         self.assertIn("query", required, "search_docs should require query")
+
+
+class TestFeishuUrlParsing(unittest.TestCase):
+    """Test _parse_feishu_url for wiki/docx/plain-token inputs."""
+
+    def setUp(self):
+        from tools.feishu_doc_tool import _parse_feishu_url
+        self.parse = _parse_feishu_url
+
+    def test_plain_token(self):
+        kind, token = self.parse("LVVzdXET1o4fvNxSYVucewoCnXf")
+        self.assertEqual(kind, "doc_token")
+        self.assertEqual(token, "LVVzdXET1o4fvNxSYVucewoCnXf")
+
+    def test_docx_url(self):
+        kind, token = self.parse(
+            "https://upiwgvvcb4.feishu.cn/docx/LVVzdXET1o4fvNxSYVucewoCnXf"
+        )
+        self.assertEqual(kind, "doc_token")
+        self.assertEqual(token, "LVVzdXET1o4fvNxSYVucewoCnXf")
+
+    def test_wiki_url(self):
+        kind, token = self.parse(
+            "https://upiwgvvcb4.feishu.cn/wiki/FLD2wzG6DiDuGzkFu2Qcskuonhh"
+        )
+        self.assertEqual(kind, "wiki_node")
+        self.assertEqual(token, "FLD2wzG6DiDuGzkFu2Qcskuonhh")
+
+    def test_lark_url(self):
+        kind, token = self.parse(
+            "https://example.larkoffice.com/docx/AbCdEfGhIjKlMnOpQrSt"
+        )
+        self.assertEqual(kind, "doc_token")
+
+    def test_empty(self):
+        kind, token = self.parse("")
+        self.assertIsNone(kind)
+        self.assertIsNone(token)
+
+    def test_non_feishu_url(self):
+        kind, token = self.parse("https://github.com/repo")
+        self.assertIsNone(kind)
+
+    def test_sheet_url(self):
+        kind, token = self.parse(
+            "https://xxx.feishu.cn/sheets/AbCdEfGhIjKlMnOpQrSt"
+        )
+        self.assertEqual(kind, "obj_token")
+
+    def test_url_with_query_params(self):
+        kind, token = self.parse(
+            "https://xxx.feishu.cn/wiki/FLD2wzG6DiDuGzkFu2Qcskuonhh?from=from_copylink"
+        )
+        self.assertEqual(kind, "wiki_node")
+        self.assertEqual(token, "FLD2wzG6DiDuGzkFu2Qcskuonhh")
 
 
 if __name__ == "__main__":
