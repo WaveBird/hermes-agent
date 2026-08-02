@@ -23,8 +23,32 @@ def set_client(client):
 
 
 def get_client():
-    """Return the lark client for the current thread, or None."""
-    return getattr(_local, "client", None)
+    """Return the lark client for the current thread, or the module-level client.
+
+    Falls back to the module-level client injected by the Feishu adapter at
+    connection time, so feishu tools work in the main gateway agent (not just
+    in the comment-agent context).
+    """
+    thread_client = getattr(_local, "client", None)
+    if thread_client is not None:
+        return thread_client
+    return _module_client
+
+
+def set_module_client(client):
+    """Set the module-level lark client (called by Feishu adapter on connect).
+
+    Unlike ``set_client`` (thread-local), this persists across threads and
+    makes the client available to the main gateway agent, not just the
+    comment agent. Set to ``None`` on disconnect to release the reference.
+    """
+    global _module_client
+    _module_client = client
+
+
+# Module-level client injected by the Feishu adapter on connect.
+# Falls back to None until the adapter calls set_module_client().
+_module_client = None
 
 
 def _check_feishu():
@@ -379,6 +403,72 @@ def _handle_add_comment(args: dict, **kwargs) -> str:
 
 
 # ---------------------------------------------------------------------------
+# feishu_drive_search_docs
+# ---------------------------------------------------------------------------
+
+_SEARCH_URI = "/open-apis/search/v2/doc_wiki/search"
+
+FEISHU_DRIVE_SEARCH_SCHEMA = {
+    "name": "feishu_drive_search_docs",
+    "description": (
+        "Search for documents and wiki pages in Feishu/Lark by keyword. "
+        "Returns matching files with their title, summary, url, token, "
+        "file_type, and owner. "
+        "Use this to find documents when you don't have a direct link, "
+        "then use feishu_doc_read with the returned token to read the content."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search keyword(s) to match document titles or content.",
+            },
+            "page_size": {
+                "type": "integer",
+                "description": "Number of results per page (max 50).",
+                "default": 20,
+            },
+            "page_token": {
+                "type": "string",
+                "description": "Pagination token for the next page of results.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+
+def _handle_search_docs(args: dict, **kwargs) -> str:
+    client = get_client()
+    if client is None:
+        return tool_error("Feishu client not available")
+
+    query = args.get("query", "").strip()
+    if not query:
+        return tool_error("query is required")
+
+    page_size = args.get("page_size", 20)
+    page_token = args.get("page_token", "").strip()
+
+    body = {
+        "query": query,
+        "page_size": page_size,
+    }
+    if page_token:
+        body["page_token"] = page_token
+
+    code, msg, data = _do_request(
+        client, "POST", _SEARCH_URI,
+        body=body,
+    )
+    if code != 0:
+        return tool_error(f"Search docs failed: code={code} msg={msg}")
+
+    return tool_result(data)
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -428,4 +518,16 @@ registry.register(
     is_async=False,
     description="Add a whole-document comment",
     emoji="\u2709\ufe0f",
+)
+
+registry.register(
+    name="feishu_drive_search_docs",
+    toolset="feishu_drive",
+    schema=FEISHU_DRIVE_SEARCH_SCHEMA,
+    handler=_handle_search_docs,
+    check_fn=_check_feishu,
+    requires_env=[],
+    is_async=False,
+    description="Search Feishu/Lark Drive documents by keyword",
+    emoji="\U0001f50d",
 )

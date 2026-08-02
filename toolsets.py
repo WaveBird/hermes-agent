@@ -312,10 +312,11 @@ TOOLSETS = {
     },
 
     "feishu_drive": {
-        "description": "Feishu/Lark document comment operations (list, reply, add)",
+        "description": "Feishu/Lark document comment operations (list, reply, add) and document search",
         "tools": [
             "feishu_drive_list_comments", "feishu_drive_list_comment_replies",
             "feishu_drive_reply_comment", "feishu_drive_add_comment",
+            "feishu_drive_search_docs",
         ],
         "includes": []
     },
@@ -526,6 +527,7 @@ TOOLSETS = {
             "feishu_drive_list_comment_replies",
             "feishu_drive_reply_comment",
             "feishu_drive_add_comment",
+            "feishu_drive_search_docs",
         ],
         "includes": []
     },

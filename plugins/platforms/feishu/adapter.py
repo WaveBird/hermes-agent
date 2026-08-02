@@ -1897,6 +1897,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_thread_loop = None
         self._loop = None
         self._event_handler = None
+        self._release_module_client()
         self._shutdown_sdk_executor()
         self._persist_seen_message_ids()
         await self._release_app_lock()
@@ -5129,6 +5130,7 @@ class FeishuAdapter(BasePlatformAdapter):
             raise RuntimeError("websockets not installed; websocket mode unavailable")
         domain = FEISHU_DOMAIN if self._domain_name != "lark" else LARK_DOMAIN
         self._client = self._build_lark_client(domain)
+        self._inject_module_client()
         self._event_handler = self._build_event_handler()
         if self._event_handler is None:
             raise RuntimeError("failed to build Feishu event handler")
@@ -5161,6 +5163,7 @@ class FeishuAdapter(BasePlatformAdapter):
             raise RuntimeError("aiohttp not installed; webhook mode unavailable")
         domain = FEISHU_DOMAIN if self._domain_name != "lark" else LARK_DOMAIN
         self._client = self._build_lark_client(domain)
+        self._inject_module_client()
         self._event_handler = self._build_event_handler()
         if self._event_handler is None:
             raise RuntimeError("failed to build Feishu event handler")
@@ -5184,6 +5187,31 @@ class FeishuAdapter(BasePlatformAdapter):
             .log_level(lark.LogLevel.WARNING)
             .build()
         )
+
+    def _inject_module_client(self) -> None:
+        """Inject the lark client into feishu tool modules.
+
+        Makes the client available to feishu_doc_tool and feishu_drive_tool
+        via their module-level ``set_module_client()`` so that feishu tools
+        work in the main gateway agent, not just in the comment-agent context.
+        """
+        try:
+            from tools.feishu_doc_tool import set_module_client as set_doc
+            from tools.feishu_drive_tool import set_module_client as set_drive
+            set_doc(self._client)
+            set_drive(self._client)
+        except Exception:
+            pass
+
+    def _release_module_client(self) -> None:
+        """Release the module-level lark client on disconnect."""
+        try:
+            from tools.feishu_doc_tool import set_module_client as set_doc
+            from tools.feishu_drive_tool import set_module_client as set_drive
+            set_doc(None)
+            set_drive(None)
+        except Exception:
+            pass
 
     async def _feishu_send_with_retry(
         self,

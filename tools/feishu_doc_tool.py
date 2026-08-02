@@ -22,8 +22,32 @@ def set_client(client):
 
 
 def get_client():
-    """Return the lark client for the current thread, or None."""
-    return getattr(_local, "client", None)
+    """Return the lark client for the current thread, or the module-level client.
+
+    Falls back to the module-level client injected by the Feishu adapter at
+    connection time, so feishu tools work in the main gateway agent (not just
+    in the comment-agent context).
+    """
+    thread_client = getattr(_local, "client", None)
+    if thread_client is not None:
+        return thread_client
+    return _module_client
+
+
+def set_module_client(client):
+    """Set the module-level lark client (called by Feishu adapter on connect).
+
+    Unlike ``set_client`` (thread-local), this persists across threads and
+    makes the client available to the main gateway agent, not just the
+    comment agent. Set to ``None`` on disconnect to release the reference.
+    """
+    global _module_client
+    _module_client = client
+
+
+# Module-level client injected by the Feishu adapter on connect.
+# Falls back to None until the adapter calls set_module_client().
+_module_client = None
 
 
 # ---------------------------------------------------------------------------
