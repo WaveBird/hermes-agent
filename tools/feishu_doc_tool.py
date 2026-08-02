@@ -9,6 +9,7 @@ import logging
 import re
 
 from tools.feishu_lark import (
+    set_module_client,  # noqa: F401  (set_client/get_client are imported by feishu_comment)
     _check_feishu,
     build_request,
     get_client,
