@@ -235,6 +235,8 @@ _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _FEISHU_FILE_SIZE_EXCEEDED_CODE = 234037
 # Chunk size for Range-based downloads — 10 MB per request.
 _FEISHU_CHUNK_DOWNLOAD_SIZE = 10 * 1024 * 1024
+# Max concurrent Range requests during chunked download.
+_FEISHU_CHUNK_CONCURRENCY = 4
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
 _DEFAULT_TEXT_BATCH_MAX_CHARS = 4000
@@ -4299,7 +4301,7 @@ class FeishuAdapter(BasePlatformAdapter):
         resource_type: str,
         fallback_filename: str,
     ) -> tuple[str, str]:
-        """Download a large file via HTTP Range requests.
+        """Download a large file via concurrent HTTP Range requests.
 
         Called as a fallback when the single-request download fails with
         Feishu error 234037 (file size exceeds limit).  The Feishu
@@ -4307,91 +4309,121 @@ class FeishuAdapter(BasePlatformAdapter):
         headers and returns ``206 Partial Content`` with a
         ``Content-Range`` header.
 
-        The first chunk also harvests ``Content-Type`` and filename from
-        the response headers.
+        Strategy: download the first chunk synchronously to harvest
+        ``Content-Range`` (total size) and metadata, then fire the
+        remaining chunks concurrently with a bounded semaphore.
         """
         chunk_size = _FEISHU_CHUNK_DOWNLOAD_SIZE
-        chunks: list[bytes] = []
+
+        # --- Phase 1: first chunk to learn total size ---
+        first_request = self._build_message_resource_request(
+            message_id=message_id,
+            file_key=file_key,
+            resource_type=resource_type,
+        )
+        first_request.headers["Range"] = f"bytes=0-{chunk_size - 1}"
+        first_response = await self._run_blocking(
+            self._client.im.v1.message_resource.get, first_request
+        )
+        if not first_response or not first_response.success():
+            logger.warning(
+                "[Feishu] Chunked download first chunk failed for %s: %s %s",
+                file_key,
+                getattr(first_response, "code", "unknown"),
+                getattr(first_response, "msg", "request failed"),
+            )
+            return "", ""
+
+        first_raw = self._read_binary_response(first_response)
+        if not first_raw:
+            logger.warning(
+                "[Feishu] Chunked download returned empty first chunk for %s",
+                file_key,
+            )
+            return "", ""
+
+        content_type = self._get_response_header(first_response, "Content-Type")
+        response_filename = getattr(first_response, "file_name", None) or ""
         total_size: int | None = None
-        content_type = ""
-        response_filename = ""
+        content_range = self._get_response_header(first_response, "Content-Range")
+        if content_range and "/" in content_range:
+            try:
+                total_size = int(content_range.rsplit("/", 1)[1])
+            except (ValueError, IndexError):
+                pass
 
-        offset = 0
-        while True:
-            end = offset + chunk_size - 1
-            if total_size is not None:
-                end = min(end, total_size - 1)
-            request = self._build_message_resource_request(
-                message_id=message_id,
-                file_key=file_key,
-                resource_type=resource_type,
+        if total_size is None:
+            # No Content-Range — can't calculate remaining chunks.
+            # Fall back to using just the first chunk.
+            logger.warning(
+                "[Feishu] Chunked download: no Content-Range header for %s, "
+                "using first chunk only (%d bytes)",
+                file_key,
+                len(first_raw),
             )
-            request.headers["Range"] = f"bytes={offset}-{end}"
-            response = await self._run_blocking(
-                self._client.im.v1.message_resource.get, request
+            raw_bytes = first_raw
+        else:
+            # --- Phase 2: concurrent download of remaining chunks ---
+            remaining_offsets: list[int] = list(
+                range(chunk_size, total_size, chunk_size)
             )
-            if not response or not response.success():
-                logger.warning(
-                    "[Feishu] Chunked download failed at offset %d for %s: %s %s",
-                    offset,
+            results: dict[int, bytes] = {}
+            semaphore = asyncio.Semaphore(_FEISHU_CHUNK_CONCURRENCY)
+
+            async def fetch_chunk(offset: int) -> None:
+                end = min(offset + chunk_size - 1, total_size - 1)  # type: ignore[operator]
+                async with semaphore:
+                    req = self._build_message_resource_request(
+                        message_id=message_id,
+                        file_key=file_key,
+                        resource_type=resource_type,
+                    )
+                    req.headers["Range"] = f"bytes={offset}-{end}"
+                    resp = await self._run_blocking(
+                        self._client.im.v1.message_resource.get, req
+                    )
+                if not resp or not resp.success():
+                    logger.warning(
+                        "[Feishu] Chunked download failed at offset %d for %s: %s %s",
+                        offset,
+                        file_key,
+                        getattr(resp, "code", "unknown"),
+                        getattr(resp, "msg", "request failed"),
+                    )
+                    results[offset] = b""
+                    return
+                results[offset] = self._read_binary_response(resp)
+
+            if remaining_offsets:
+                logger.info(
+                    "[Feishu] Chunked download: %d chunks (%d concurrent) for %s (%d bytes)",
+                    len(remaining_offsets) + 1,
+                    _FEISHU_CHUNK_CONCURRENCY,
                     file_key,
-                    getattr(response, "code", "unknown"),
-                    getattr(response, "msg", "request failed"),
-                )
-                return "", ""
-
-            raw = self._read_binary_response(response)
-            if not raw:
-                logger.warning(
-                    "[Feishu] Chunked download returned empty data at offset %d for %s",
-                    offset,
-                    file_key,
-                )
-                return "", ""
-
-            # Harvest metadata from the first chunk.
-            if offset == 0:
-                content_type = self._get_response_header(response, "Content-Type")
-                response_filename = getattr(response, "file_name", None) or ""
-                # Parse total size from Content-Range header:
-                #   "bytes 0-1048575/120938104"
-                content_range = self._get_response_header(
-                    response, "Content-Range"
-                )
-                if content_range and "/" in content_range:
-                    try:
-                        total_size = int(content_range.rsplit("/", 1)[1])
-                    except (ValueError, IndexError):
-                        pass
-
-            chunks.append(raw)
-            downloaded = sum(len(c) for c in chunks)
-            if total_size:
-                logger.debug(
-                    "[Feishu] Chunked download progress: %d/%d bytes (%.0f%%) for %s",
-                    downloaded,
                     total_size,
-                    downloaded / total_size * 100,
-                    file_key,
                 )
+                await asyncio.gather(*(fetch_chunk(off) for off in remaining_offsets))
             else:
-                logger.debug(
-                    "[Feishu] Chunked download progress: %d bytes (total unknown) for %s",
-                    downloaded,
+                logger.info(
+                    "[Feishu] Chunked download: single chunk for %s (%d bytes)",
                     file_key,
+                    total_size,
                 )
 
-            # Advance.
-            offset += len(raw)
-            # Stop if we've received all the data.
-            if total_size is not None and offset >= total_size:
-                break
-            # Safety: if the server returned fewer bytes than requested without
-            # reaching the total, we've hit the end of the file.
-            if len(raw) < chunk_size:
-                break
+            # Assemble in order.
+            ordered = [first_raw]
+            for off in remaining_offsets:
+                data = results.get(off, b"")
+                if not data:
+                    logger.warning(
+                        "[Feishu] Chunked download: missing data at offset %d for %s",
+                        off,
+                        file_key,
+                    )
+                    return "", ""
+                ordered.append(data)
+            raw_bytes = b"".join(ordered)
 
-        raw_bytes = b"".join(chunks)
         if not raw_bytes:
             return "", ""
 
