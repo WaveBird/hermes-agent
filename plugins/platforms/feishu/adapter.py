@@ -227,6 +227,14 @@ _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
 _FEISHU_SEND_ATTEMPTS = 3
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
+
+# Feishu error code returned when the requested file exceeds the
+# single-request download size limit (~25 MB).  The API still supports
+# HTTP Range requests for such files, so the adapter falls back to
+# chunked download via ``Range: bytes=start-end`` headers.
+_FEISHU_FILE_SIZE_EXCEEDED_CODE = 234037
+# Chunk size for Range-based downloads — 10 MB per request.
+_FEISHU_CHUNK_DOWNLOAD_SIZE = 10 * 1024 * 1024
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
 _DEFAULT_TEXT_BATCH_MAX_CHARS = 4000
@@ -4210,12 +4218,31 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 response = await self._run_blocking(self._client.im.v1.message_resource.get, request)
                 if not response or not response.success():
+                    code = getattr(response, "code", None)
+                    # Feishu error 234037 = file size exceeds the single-request
+                    # download limit (~25 MB).  The API supports HTTP Range
+                    # requests, so fall back to chunked download.
+                    if code == _FEISHU_FILE_SIZE_EXCEEDED_CODE:
+                        logger.info(
+                            "[Feishu] File %s exceeds download size limit (code %s), "
+                            "switching to chunked download via Range requests",
+                            file_key,
+                            code,
+                        )
+                        chunked = await self._download_feishu_resource_chunked(
+                            message_id=message_id,
+                            file_key=file_key,
+                            resource_type=request_type,
+                            fallback_filename=fallback_filename,
+                        )
+                        if chunked:
+                            return chunked
                     logger.debug(
                         "[Feishu] Resource download failed for %s/%s via type=%s: %s %s",
                         message_id,
                         file_key,
                         request_type,
-                        getattr(response, "code", "unknown"),
+                        code,
                         getattr(response, "msg", "request failed"),
                     )
                     continue
@@ -4263,6 +4290,157 @@ class FeishuAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
         return "", ""
+
+    async def _download_feishu_resource_chunked(
+        self,
+        *,
+        message_id: str,
+        file_key: str,
+        resource_type: str,
+        fallback_filename: str,
+    ) -> tuple[str, str]:
+        """Download a large file via HTTP Range requests.
+
+        Called as a fallback when the single-request download fails with
+        Feishu error 234037 (file size exceeds limit).  The Feishu
+        ``message_resource`` API supports standard ``Range: bytes=start-end``
+        headers and returns ``206 Partial Content`` with a
+        ``Content-Range`` header.
+
+        The first chunk also harvests ``Content-Type`` and filename from
+        the response headers.
+        """
+        chunk_size = _FEISHU_CHUNK_DOWNLOAD_SIZE
+        chunks: list[bytes] = []
+        total_size: int | None = None
+        content_type = ""
+        response_filename = ""
+
+        offset = 0
+        while True:
+            end = offset + chunk_size - 1
+            if total_size is not None:
+                end = min(end, total_size - 1)
+            request = self._build_message_resource_request(
+                message_id=message_id,
+                file_key=file_key,
+                resource_type=resource_type,
+            )
+            request.headers["Range"] = f"bytes={offset}-{end}"
+            response = await self._run_blocking(
+                self._client.im.v1.message_resource.get, request
+            )
+            if not response or not response.success():
+                logger.warning(
+                    "[Feishu] Chunked download failed at offset %d for %s: %s %s",
+                    offset,
+                    file_key,
+                    getattr(response, "code", "unknown"),
+                    getattr(response, "msg", "request failed"),
+                )
+                return "", ""
+
+            raw = self._read_binary_response(response)
+            if not raw:
+                logger.warning(
+                    "[Feishu] Chunked download returned empty data at offset %d for %s",
+                    offset,
+                    file_key,
+                )
+                return "", ""
+
+            # Harvest metadata from the first chunk.
+            if offset == 0:
+                content_type = self._get_response_header(response, "Content-Type")
+                response_filename = getattr(response, "file_name", None) or ""
+                # Parse total size from Content-Range header:
+                #   "bytes 0-1048575/120938104"
+                content_range = self._get_response_header(
+                    response, "Content-Range"
+                )
+                if content_range and "/" in content_range:
+                    try:
+                        total_size = int(content_range.rsplit("/", 1)[1])
+                    except (ValueError, IndexError):
+                        pass
+
+            chunks.append(raw)
+            downloaded = sum(len(c) for c in chunks)
+            if total_size:
+                logger.debug(
+                    "[Feishu] Chunked download progress: %d/%d bytes (%.0f%%) for %s",
+                    downloaded,
+                    total_size,
+                    downloaded / total_size * 100,
+                    file_key,
+                )
+            else:
+                logger.debug(
+                    "[Feishu] Chunked download progress: %d bytes (total unknown) for %s",
+                    downloaded,
+                    file_key,
+                )
+
+            # Advance.
+            offset += len(raw)
+            # Stop if we've received all the data.
+            if total_size is not None and offset >= total_size:
+                break
+            # Safety: if the server returned fewer bytes than requested without
+            # reaching the total, we've hit the end of the file.
+            if len(raw) < chunk_size:
+                break
+
+        raw_bytes = b"".join(chunks)
+        if not raw_bytes:
+            return "", ""
+
+        filename = response_filename or fallback_filename or f"{resource_type}_{file_key}"
+        media_type = self._normalize_media_type(
+            content_type,
+            default=self._guess_media_type_from_filename(filename),
+        )
+
+        if media_type.startswith("image/"):
+            ext = self._guess_extension(filename, content_type, ".jpg", allowed=_IMAGE_EXTENSIONS)
+            cached_path = cache_image_from_bytes(raw_bytes, ext=ext)
+            logger.info(
+                "[Feishu] Cached message image resource (chunked, %d bytes) at %s",
+                len(raw_bytes),
+                cached_path,
+            )
+            return cached_path, media_type or self._default_image_media_type(ext)
+
+        if resource_type == "audio" or media_type.startswith("audio/"):
+            ext = self._guess_extension(filename, content_type, ".ogg", allowed=_AUDIO_EXTENSIONS)
+            cached_path = cache_audio_from_bytes(raw_bytes, ext=ext)
+            logger.info(
+                "[Feishu] Cached message audio resource (chunked, %d bytes) at %s",
+                len(raw_bytes),
+                cached_path,
+            )
+            return cached_path, (media_type or f"audio/{ext.lstrip('.') or 'ogg'}")
+
+        if media_type.startswith("video/"):
+            if not Path(filename).suffix:
+                filename = f"{filename}.mp4"
+            cached_path = cache_document_from_bytes(raw_bytes, filename)
+            logger.info(
+                "[Feishu] Cached message video resource (chunked, %d bytes) at %s",
+                len(raw_bytes),
+                cached_path,
+            )
+            return cached_path, media_type
+
+        if not Path(filename).suffix and media_type in _DOCUMENT_MIME_TO_EXT:
+            filename = f"{filename}{_DOCUMENT_MIME_TO_EXT[media_type]}"
+        cached_path = cache_document_from_bytes(raw_bytes, filename)
+        logger.info(
+            "[Feishu] Cached message document resource (chunked, %d bytes) at %s",
+            len(raw_bytes),
+            cached_path,
+        )
+        return cached_path, (media_type or self._guess_document_media_type(filename))
 
     # =========================================================================
     # Static helpers — extension / media-type guessing
