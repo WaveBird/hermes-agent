@@ -3072,6 +3072,81 @@ class FeishuAdapter(BasePlatformAdapter):
 
     # --- Static helpers — extension / media-type guessing ---
     @staticmethod
+    async def _download_feishu_resource_chunked(
+        self, *, message_id: str, file_key: str, resource_type: str, fallback_filename: str,
+    ) -> tuple[str, str]:
+        """Download a large file via HTTP Range requests.
+
+        Called as a fallback when the single-request download fails with
+        Feishu error 234037 (file size exceeds limit).
+        """
+        chunk_size = _FEISHU_CHUNK_DOWNLOAD_SIZE
+        chunks: list[bytes] = []
+        total_size: int | None = None
+        content_type = ""
+        response_filename = ""
+
+        offset = 0
+        while True:
+            end = offset + chunk_size - 1
+            if total_size is not None:
+                end = min(end, total_size - 1)
+            request = self._build_message_resource_request(
+                message_id=message_id, file_key=file_key, resource_type=resource_type,
+            )
+            request.headers["Range"] = f"bytes={offset}-{end}"
+            response = await self._run_blocking(self._client.im.v1.message_resource.get, request)
+            if not response or not response.success():
+                logger.warning(
+                    "[Feishu] Chunked download failed at offset %d for %s: %s %s",
+                    offset, file_key,
+                    getattr(response, "code", "unknown"), getattr(response, "msg", "request failed"),
+                )
+                return "", ""
+            raw = self._read_binary_response(response)
+            if not raw:
+                logger.warning("[Feishu] Chunked download returned empty data at offset %d for %s", offset, file_key)
+                return "", ""
+            if offset == 0:
+                content_type = self._get_response_header(response, "Content-Type")
+                response_filename = getattr(response, "file_name", None) or ""
+                content_range = self._get_response_header(response, "Content-Range")
+                if content_range and "/" in content_range:
+                    try:
+                        total_size = int(content_range.rsplit("/", 1)[1])
+                    except (ValueError, IndexError):
+                        pass
+            chunks.append(raw)
+            offset += len(raw)
+            if total_size is not None and offset >= total_size:
+                break
+            if len(raw) < chunk_size:
+                break
+
+        raw_bytes = b"".join(chunks)
+        if not raw_bytes:
+            return "", ""
+        filename = response_filename or fallback_filename or f"{resource_type}_{file_key}"
+        media_type = self._normalize_media_type(content_type, default=self._guess_media_type_from_filename(filename))
+        if media_type.startswith("image/"):
+            ext = self._guess_extension(filename, content_type, ".jpg", allowed=_IMAGE_EXTENSIONS)
+            cached_path = await cache_image_from_bytes_async(raw_bytes, ext=ext)
+            return cached_path, media_type or self._default_image_media_type(ext)
+        if resource_type == "audio" or media_type.startswith("audio/"):
+            ext = self._guess_extension(filename, content_type, ".ogg", allowed=_AUDIO_EXTENSIONS)
+            cached_path = await cache_audio_from_bytes_async(raw_bytes, ext=ext)
+            return cached_path, (media_type or f"audio/{ext.lstrip('.') or 'ogg'}")
+        if media_type.startswith("video/"):
+            if not Path(filename).suffix:
+                filename = f"{filename}.mp4"
+            cached_path = await cache_document_from_bytes_async(raw_bytes, filename)
+            return cached_path, media_type
+        if not Path(filename).suffix and media_type in _DOCUMENT_MIME_TO_EXT:
+            filename = f"{filename}{_DOCUMENT_MIME_TO_EXT[media_type]}"
+        cached_path = await cache_document_from_bytes_async(raw_bytes, filename)
+        return cached_path, (media_type or self._guess_document_media_type(filename))
+
+
     def _read_binary_response(response: Any) -> bytes:
         file_obj = getattr(response, "file", None)
         if file_obj is None:
