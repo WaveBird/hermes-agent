@@ -9,6 +9,7 @@ import {
 import { useStore } from '@nanostores/react'
 import { type FC, useCallback, useMemo, useState } from 'react'
 
+import { ChangedFilesCard } from '@/components/assistant-ui/thread/changed-files-card'
 import {
   contentHasVisibleText,
   messageContentText,
@@ -17,29 +18,27 @@ import {
 import { MESSAGE_PARTS_COMPONENTS } from '@/components/assistant-ui/thread/message-parts'
 import { ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
 import { ResponseLoadingIndicator, StreamStallIndicator } from '@/components/assistant-ui/thread/status'
-import { formatMessageTimestamp } from '@/components/assistant-ui/thread/timestamp'
+import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
+import { useMessageReactions, useTapbackDoubleClick } from '@/components/assistant-ui/thread/use-message-reactions'
+import { AGENT_MESSAGE_RE } from '@/components/assistant-ui/thread/user-message'
 import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button'
+import { formatElapsed } from '@/components/chat/activity-timer'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { Codicon } from '@/components/ui/codicon'
 import { CopyButton } from '@/components/ui/copy-button'
 import { useI18n } from '@/i18n'
-import type { ChatMessage } from '@/lib/chat-messages'
 import { triggerHaptic } from '@/lib/haptics'
 import { AudioLines, GitForkIcon, Loader2Icon, RefreshCwIcon, SmilePlusIcon, VolumeXIcon, XIcon } from '@/lib/icons'
 import { extractPreviewTargets } from '@/lib/preview-targets'
-import { formatAgo } from '@/lib/time'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
 import { notifyError } from '@/store/notifications'
-import { toggleMessageReaction } from '@/store/reactions'
-import { $reactionsEnabled } from '@/store/reactions-enabled'
-import { $agentReactions, $localReactions, mergeReactions, setLocalReaction } from '@/store/reactions-local'
 import { $voicePlayback } from '@/store/voice-playback'
-import type { MessageReaction } from '@/types/hermes'
 
-// Stable empty identity — a fresh [] per render would re-run every consumer.
-const EMPTY_REACTIONS: MessageReaction[] = []
+// Stable empty identity for the settled-parts selector — a fresh [] per render
+// would re-derive the changed-files card on every message re-render.
+const EMPTY_PARTS: readonly unknown[] = []
 
 interface MessageActionProps {
   messageId: string
@@ -59,6 +58,40 @@ export const AssistantMessage: FC<{
   const messageRuntime = useMessageRuntime()
   const { t } = useI18n()
 
+  // A reply to an inter-agent delivery is part of that exchange, not part of
+  // the human conversation — collapse it under a compact notice ("Reply to
+  // <sender>", expandable), mirroring the sender-side notice the previous
+  // user message already renders as. Grok-bots parity: the transcript shows
+  // events; the texts are one click away. Detection: the immediately
+  // preceding user message matches AGENT_MESSAGE_RE.
+  const interAgentSender = useAuiState(s => {
+    const messages = s.thread.messages
+
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].id !== s.message.id) {
+        continue
+      }
+
+      for (let j = i - 1; j >= 0; j--) {
+        const prev = messages[j] as { content?: unknown; role?: string }
+
+        if (prev.role === 'assistant') {
+          return null
+        }
+
+        if (prev.role === 'user') {
+          const match = AGENT_MESSAGE_RE.exec(messageContentText(prev.content as never).trim())
+
+          return match ? (match[1] || match[3] || 'agent').trim() : null
+        }
+      }
+
+      return null
+    }
+
+    return null
+  })
+
   // PERF: this component must NOT subscribe to the streaming text. Every
   // selector here returns a value that stays referentially stable across
   // token flushes (booleans, status strings, '' while running), so the
@@ -72,6 +105,17 @@ export const AssistantMessage: FC<{
   // tool-heavy turn doesn't grow a copy/refresh bar per paragraph (see
   // ChatMessage.interim).
   const isInterim = useAuiState(s => s.message.metadata?.custom?.interim === true)
+
+  // Whole-turn wall-clock seconds (set once at completion — referentially
+  // stable across the 30 Hz delta stream, so this adds no per-token renders).
+  const turnDurationS = useAuiState(s => s.message.metadata?.custom?.durationS as number | undefined)
+
+  // The thinking/stall indicator belongs to the TAIL of the thread, period. A
+  // stale pending bubble mid-transcript (a turn that ended without its settle
+  // event, a steer race) must never show one — a spinner above a later user
+  // message reads as the agent answering out of order. Booleans are stable
+  // across token flushes, so this selector adds no streaming re-renders.
+  const isLastMessage = useAuiState(s => s.thread.messages[s.thread.messages.length - 1]?.id === s.message.id)
 
   // Preview targets only materialize once the turn completes — while running
   // the selector returns '' (stable), so per-token flushes skip the regex
@@ -90,7 +134,55 @@ export const AssistantMessage: FC<{
 
   const getMessageText = useCallback(() => messageContentText(messageRuntime.getState().content), [messageRuntime])
 
+  // Cursor's changed-files card only appears once the turn settles: while the
+  // agent is still editing, the tool rows narrate each patch and a card that
+  // grew a row per write would thrash the transcript. `[]` while running keeps
+  // this selector referentially stable across the 30 Hz delta stream.
+  //
+  // It also only rides the LAST turn. The card is a "here's what just landed"
+  // summary, not a per-turn artifact: leaving one behind on every reply would
+  // stack a wall of stale cards down the transcript. Sending the next message
+  // retires it — the working tree it describes is already history by then.
+  const settledParts = useAuiState(s => {
+    const isLastMessage = s.thread.messages[s.thread.messages.length - 1]?.id === s.message.id
+
+    return s.message.status?.type === 'running' || !isLastMessage ? EMPTY_PARTS : s.message.parts
+  })
+
   const enterRef = useEnterAnimation(isRunning, `assistant-message:${messageId}`)
+
+  // Double-click the reply to heart it (iMessage). Undefined while reactions
+  // are off, so the root carries no listener at all.
+  const onDoubleClick = useTapbackDoubleClick(messageId, 'assistant')
+
+  // Reply inside an inter-agent exchange: render collapsed (Grok-bots
+  // parity — the transcript shows the event; the text is one click away).
+  // Never collapse while streaming: the user should see progress, and the
+  // status selectors above stay live either way.
+  if (interAgentSender && !isRunning) {
+    return (
+      <MessagePrimitive.Root
+        className="group flex w-full min-w-0 max-w-full flex-col gap-0 self-start overflow-hidden pb-(--conversation-turn-gap)"
+        data-role="assistant"
+        data-slot="aui_assistant-message-root"
+      >
+        <div className="flex max-w-[min(86%,44rem)] flex-col gap-0.5 self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/60">
+          <span className="flex items-center justify-center gap-1.5">
+            <Codicon className="shrink-0 text-muted-foreground/55" name="arrow-small-right" size="0.8125rem" />
+            <span className="wrap-anywhere">Replied to {interAgentSender}</span>
+          </span>
+          <details className="self-center">
+            <summary className="cursor-pointer select-none text-center text-muted-foreground/45 hover:text-muted-foreground/70">
+              show reply
+            </summary>
+            <div className="mt-1 max-w-[36rem] rounded-lg border border-(--ui-stroke-tertiary) px-3 py-2 text-left text-[0.75rem] leading-5 text-foreground/85">
+              <MessagePrimitive.Parts components={MESSAGE_PARTS_COMPONENTS} />
+            </div>
+          </details>
+        </div>
+      </MessagePrimitive.Root>
+    )
+  }
 
   return (
     <MessagePrimitive.Root
@@ -98,6 +190,7 @@ export const AssistantMessage: FC<{
       data-role="assistant"
       data-slot="aui_assistant-message-root"
       data-streaming={isRunning ? 'true' : undefined}
+      onDoubleClick={onDoubleClick}
       ref={enterRef}
     >
       <div
@@ -106,7 +199,7 @@ export const AssistantMessage: FC<{
       >
         {/* Todos render in the composer status stack now, not inline. */}
         <MessagePrimitive.Parts components={MESSAGE_PARTS_COMPONENTS} />
-        {isPlaceholder ? <ResponseLoadingIndicator /> : isRunning && <StreamStallIndicator />}
+        {isLastMessage && (isPlaceholder ? <ResponseLoadingIndicator /> : isRunning && <StreamStallIndicator />)}
         {previewTargets.length > 0 && (
           <div className="mt-3 flex flex-wrap gap-2">
             {previewTargets.map(target => (
@@ -133,9 +226,18 @@ export const AssistantMessage: FC<{
           </ErrorPrimitive.Root>
         </MessagePrimitive.Error>
       </div>
+      <MessageTimelineTimestamp className="px-(--message-text-indent) pt-0.5" suppressIfDuplicatePart />
       {hasVisibleText && !isInterim && (
-        <AssistantFooter getMessageText={getMessageText} messageId={messageId} onBranchInNewChat={onBranchInNewChat} />
+        <AssistantFooter
+          durationS={turnDurationS}
+          getMessageText={getMessageText}
+          messageId={messageId}
+          onBranchInNewChat={onBranchInNewChat}
+        />
       )}
+      {/* Last thing in the turn — under the action bar, the way Cursor ends a
+          turn on its summary rather than burying it above the controls. */}
+      <ChangedFilesCard parts={settledParts} />
     </MessagePrimitive.Root>
   )
 }
@@ -144,38 +246,15 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
   const { t } = useI18n()
   const copy = t.assistant.thread
 
-  const reactions = useAuiState(s => {
-    const custom = (s.message.metadata?.custom ?? {}) as { reactions?: MessageReaction[] }
-
-    return custom.reactions ?? EMPTY_REACTIONS
-  })
-
-  const rowId = useAuiState(s => {
-    const custom = (s.message.metadata?.custom ?? {}) as { rowId?: number }
-
-    return custom.rowId
-  })
-
   const [pickerOpen, setPickerOpen] = useState(false)
-  const reactionsEnabled = useStore($reactionsEnabled)
-  const localAll = useStore($localReactions)
-  const agentLive = useStore($agentReactions)
+  const { enabled: reactionsEnabled, react, reactions: shownReactions } = useMessageReactions(messageId, 'assistant')
 
-  const shownReactions = mergeReactions(
-    reactions,
-    localAll[messageId],
-    rowId !== undefined ? agentLive[rowId] : undefined
-  )
-
-  const react = useCallback(
+  const pickEmoji = useCallback(
     (emoji: null | string) => {
       setPickerOpen(false)
-      // Flip the UI immediately — a tapback is direct manipulation and must
-      // never wait on a round-trip. Persistence follows in the background.
-      setLocalReaction(messageId, emoji)
-      void toggleMessageReaction({ id: messageId, role: 'assistant', rowId, reactions } as ChatMessage, emoji)
+      react(emoji)
     },
-    [messageId, reactions, rowId]
+    [react]
   )
 
   return (
@@ -193,7 +272,6 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
         }
         data-slot="aui_msg-actions"
       >
-        <MessageAge />
         {onBranchInNewChat && (
           <TooltipIconButton
             onClick={() => {
@@ -224,7 +302,7 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
       {(reactionsEnabled || shownReactions.length > 0) && (
         <ReactionPicker
           onOpenChange={setPickerOpen}
-          onSelect={react}
+          onSelect={pickEmoji}
           open={pickerOpen}
           selected={shownReactions.find(reaction => reaction.author === 'user')?.emoji}
         >
@@ -295,42 +373,35 @@ const ReadAloudButton: FC<{ getText: () => string; messageId: string }> = ({ get
   )
 }
 
-const MessageAge: FC = () => {
+const AssistantFooter: FC<MessageActionProps & { durationS?: number }> = ({ durationS, ...props }) => {
   const { t } = useI18n()
-  const createdAt = useAuiState(s => s.message.createdAt)
-  const date = createdAt ? new Date(createdAt) : null
 
-  if (!date || Number.isNaN(date.getTime())) {
-    return null
-  }
-
-  // Compact "2h ago" (shared util) with the absolute time on hover.
   return (
-    <span
-      className="px-0.5 text-[0.6875rem] tabular-nums text-muted-foreground"
-      title={formatMessageTimestamp(date, t.assistant.thread) || undefined}
-    >
-      {formatAgo(date.getTime(), t.agents)}
-    </span>
+    <div className="flex min-h-6 flex-col items-end gap-1 pr-(--message-text-indent) pl-(--message-text-indent)">
+      {durationS !== undefined && (
+        <span
+          className="select-none px-0.5 text-[0.6875rem] leading-5 tabular-nums text-muted-foreground"
+          data-slot="aui_turn-duration"
+          title={t.assistant.thread.turnDuration(formatElapsed(durationS))}
+        >
+          ⏱ {formatElapsed(durationS)}
+        </span>
+      )}
+      <BranchPickerPrimitive.Root
+        className="inline-flex h-6 items-center gap-1 text-xs text-muted-foreground"
+        hideWhenSingleBranch
+      >
+        <BranchPickerPrimitive.Previous className="grid size-6 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-default disabled:opacity-35">
+          <Codicon name="chevron-left" size="0.875rem" />
+        </BranchPickerPrimitive.Previous>
+        <span className="tabular-nums">
+          <BranchPickerPrimitive.Number /> / <BranchPickerPrimitive.Count />
+        </span>
+        <BranchPickerPrimitive.Next className="grid size-6 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-default disabled:opacity-35">
+          <Codicon name="chevron-right" size="0.875rem" />
+        </BranchPickerPrimitive.Next>
+      </BranchPickerPrimitive.Root>
+      <AssistantActionBar {...props} />
+    </div>
   )
 }
-
-const AssistantFooter: FC<MessageActionProps> = props => (
-  <div className="flex min-h-6 flex-col items-end gap-1 pr-(--message-text-indent) pl-(--message-text-indent)">
-    <BranchPickerPrimitive.Root
-      className="inline-flex h-6 items-center gap-1 text-xs text-muted-foreground"
-      hideWhenSingleBranch
-    >
-      <BranchPickerPrimitive.Previous className="grid size-6 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-default disabled:opacity-35">
-        <Codicon name="chevron-left" size="0.875rem" />
-      </BranchPickerPrimitive.Previous>
-      <span className="tabular-nums">
-        <BranchPickerPrimitive.Number /> / <BranchPickerPrimitive.Count />
-      </span>
-      <BranchPickerPrimitive.Next className="grid size-6 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-default disabled:opacity-35">
-        <Codicon name="chevron-right" size="0.875rem" />
-      </BranchPickerPrimitive.Next>
-    </BranchPickerPrimitive.Root>
-    <AssistantActionBar {...props} />
-  </div>
-)

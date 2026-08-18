@@ -498,7 +498,7 @@ function overviewRuns(lines: DiffLine[]): { kind: 'add' | 'remove'; sizePct: num
   const total = lines.length || 1
   const runs: { kind: 'add' | 'remove'; sizePct: number; startPct: number }[] = []
 
-  for (let i = 0; i < lines.length; ) {
+  for (let i = 0; i < lines.length;) {
     const kind = lines[i].kind
 
     if (kind === 'context') {
@@ -645,7 +645,13 @@ export function FileDiffPanel({
       >
         {showLineNumbers ? (
           <div className="grid min-w-max grid-cols-[auto_minmax(0,1fr)]">
-            <div className="sticky left-0 z-1 select-none bg-(--ui-editor-surface-background) py-3 text-muted-foreground/55">
+            <div
+              className="sticky left-0 z-1 select-none bg-(--ui-editor-surface-background) py-3 text-muted-foreground/55"
+              // Masks the code scrolling horizontally beneath it, so it has to
+              // stay opaque when window glass thins the field. See
+              // `[data-glass-opaque]` in styles.css.
+              data-glass-opaque=""
+            >
               {beforeRows > 0 && <div aria-hidden style={{ height: beforeRows * PREVIEW_LINE_PX }} />}
               {visibleLineChunks.map(chunk => (
                 <div className="block" key={chunk.start}>

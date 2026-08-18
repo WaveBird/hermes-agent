@@ -86,6 +86,75 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["source"] == "manual"
 
 
+class TestCustomProviderPoolLoopbackNoKeyExemption:
+    """Regression for issue #86864: legacy custom_providers configs often
+    used short/placeholder api_keys ('123', 'm') for local no-auth
+    services like Ollama -- fine for the endpoint itself, but
+    has_usable_secret's 4-char floor now rejects them with a misleading
+    "No usable credentials found" error and no migration path. Every
+    OTHER resolution path in this file already substitutes
+    "no-key-required" for a loopback endpoint with no usable secret; the
+    credential-pool path was the one gap.
+    """
+
+    @staticmethod
+    def _pool_with(api_key: str):
+        entry = SimpleNamespace(runtime_api_key=api_key, access_token="")
+
+        class _Pool:
+            def has_credentials(self):
+                return True
+
+            def select(self):
+                return entry
+
+        return _Pool()
+
+    def test_short_placeholder_key_exempted_for_loopback_endpoint(self, monkeypatch):
+        """The exact reported repro: a 3-char legacy placeholder key
+        ('123') for a local Ollama endpoint must resolve to the same
+        "no-key-required" placeholder every other local no-auth path uses,
+        not the raw unusable value."""
+        monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda base_url, provider_name=None: "custom:local-ollama")
+        monkeypatch.setattr(rp, "load_pool", lambda pool_key: self._pool_with("123"))
+
+        result = rp._try_resolve_from_custom_pool("http://localhost:11434/v1", "custom", None)
+
+        assert result is not None
+        assert result["api_key"] == "no-key-required"
+
+    def test_single_char_placeholder_key_also_exempted(self, monkeypatch):
+        monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda base_url, provider_name=None: "custom:local")
+        monkeypatch.setattr(rp, "load_pool", lambda pool_key: self._pool_with("m"))
+
+        result = rp._try_resolve_from_custom_pool("http://127.0.0.1:11434/v1", "custom", None)
+
+        assert result["api_key"] == "no-key-required"
+
+    def test_short_key_not_exempted_for_non_loopback_endpoint(self, monkeypatch):
+        """Sanity: the exemption is scoped to loopback hosts only -- a
+        remote endpoint with a genuinely-too-short key must NOT get a
+        free pass. The short value passes through unchanged, so the
+        downstream has_usable_secret() gate still catches it."""
+        monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda base_url, provider_name=None: "custom:remote")
+        monkeypatch.setattr(rp, "load_pool", lambda pool_key: self._pool_with("xy"))
+
+        result = rp._try_resolve_from_custom_pool("https://api.remote-vendor.example/v1", "custom", None)
+
+        assert result["api_key"] == "xy"
+
+    def test_usable_loopback_key_passes_through_unchanged(self, monkeypatch):
+        """Sanity: a genuinely usable key for a loopback endpoint (a real
+        API key happens to be configured for a local proxy, say) must not
+        be silently overwritten."""
+        monkeypatch.setattr(rp, "get_custom_provider_pool_key", lambda base_url, provider_name=None: "custom:local")
+        monkeypatch.setattr(rp, "load_pool", lambda pool_key: self._pool_with("sk-genuinely-long-real-key-12345"))
+
+        result = rp._try_resolve_from_custom_pool("http://localhost:11434/v1", "custom", None)
+
+        assert result["api_key"] == "sk-genuinely-long-real-key-12345"
+
+
 def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
     """When requested_provider is 'auto' and Qwen creds fail, fall through."""
     from hermes_cli.auth import AuthError
@@ -279,6 +348,65 @@ def test_resolve_runtime_provider_openrouter_explicit(monkeypatch):
     assert resolved["api_key"] == "test-key"
     assert resolved["base_url"] == "https://example.com/v1"
     assert resolved["source"] == "explicit"
+
+
+@pytest.mark.parametrize(
+    "case_name, model_cfg, expected_api_mode",
+    [
+        (
+            "stale_anthropic_api_mode_is_ignored_on_provider_switch",
+            {
+                "provider": "anthropic",
+                "api_mode": "anthropic_messages",
+                "default": "claude-3-5-sonnet",
+            },
+            "chat_completions",
+        ),
+        (
+            "matching_provider_still_honors_persisted_api_mode",
+            {
+                "provider": "gemini",
+                "api_mode": "anthropic_messages",
+                "default": "gemini-2.5-pro",
+            },
+            "anthropic_messages",
+        ),
+        (
+            "no_persisted_provider_still_honors_api_mode",
+            {
+                "api_mode": "anthropic_messages",
+                "default": "gemini-2.5-pro",
+            },
+            "anthropic_messages",
+        ),
+    ],
+)
+def test_resolve_runtime_provider_gemini_explicit_api_mode_provider_guard(
+    monkeypatch, case_name, model_cfg, expected_api_mode
+):
+    """A persisted model.api_mode from a different provider must not leak
+    into an explicitly-resolved provider after a switch (issue #74318).
+
+    Only when ``model_cfg["provider"]`` matches the provider actually being
+    resolved (or is unset) should the persisted api_mode be honoured.
+    """
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "gemini")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: model_cfg)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_BASE_URL", raising=False)
+
+    resolved = rp.resolve_runtime_provider(
+        requested="gemini",
+        explicit_api_key="fake-gemini-key",
+        explicit_base_url="https://fake-gemini-endpoint.example.com/v1beta/",
+    )
+
+    assert resolved["provider"] == "gemini", case_name
+    assert resolved["api_mode"] == expected_api_mode, case_name
+    assert resolved["api_key"] == "fake-gemini-key", case_name
+    assert resolved["base_url"] == "https://fake-gemini-endpoint.example.com/v1beta", case_name
+    assert resolved["source"] == "explicit", case_name
 
 
 def test_resolve_runtime_provider_auto_uses_openrouter_pool(monkeypatch):

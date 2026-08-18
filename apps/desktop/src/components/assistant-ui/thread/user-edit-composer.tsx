@@ -13,6 +13,7 @@ import {
   useState
 } from 'react'
 
+import { ComposerDirectiveActions } from '@/app/chat/composer/directive-actions'
 import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from '@/app/chat/composer/drop-affordance'
 import {
   type ComposerInsertMode,
@@ -23,6 +24,7 @@ import {
   releaseActiveComposer
 } from '@/app/chat/composer/focus'
 import { useAtCompletions } from '@/app/chat/composer/hooks/use-at-completions'
+import { rebuildAroundCaret } from '@/app/chat/composer/hooks/use-composer-trigger'
 import { useComposerUndo } from '@/app/chat/composer/hooks/use-composer-undo'
 import { useEmojiCompletions } from '@/app/chat/composer/hooks/use-emoji-completions'
 import { useSlashCompletions } from '@/app/chat/composer/hooks/use-slash-completions'
@@ -42,7 +44,7 @@ import {
   replaceBeforeCaret,
   RICH_INPUT_SLOT
 } from '@/app/chat/composer/rich-editor'
-import { detectTrigger, textBeforeCaret, type TriggerState } from '@/app/chat/composer/text-utils'
+import { detectTrigger, openDirectiveScope, textBeforeCaret, type TriggerState } from '@/app/chat/composer/text-utils'
 import { ComposerTriggerPopover } from '@/app/chat/composer/trigger-popover'
 import { isRedoShortcut, isUndoShortcut } from '@/app/chat/composer/undo-history'
 import { chipTypedUrlOnSpace, linkifyUrls } from '@/app/chat/composer/url-refs'
@@ -72,7 +74,7 @@ import { Loader2Icon } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
 import { notifyError } from '@/store/notifications'
-import { $connection } from '@/store/session'
+import { $connection, $terminalBackend } from '@/store/session'
 import { notifyThreadEditClose } from '@/store/thread-scroll'
 
 interface UserEditComposerProps {
@@ -93,6 +95,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   // mount-time snapshot can incorrectly classify every later blur as dirty.
   const initialDraftRef = useRef<string | null>(null)
   const draftRef = useRef(draft)
+  const composingRef = useRef(false)
   const dragDepthRef = useRef(0)
   const [dragActive, setDragActive] = useState(false)
   const [trigger, setTrigger] = useState<TriggerState | null>(null)
@@ -352,9 +355,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
         : fragment.append(document.createTextNode(text))
 
       if (!replaceBeforeCaret(editor, trigger.tokenLength, fragment)) {
-        const current = composerPlainText(editor)
-        renderComposerContents(editor, `${current.slice(0, Math.max(0, current.length - trigger.tokenLength))}${text}`)
-        placeCaretEnd(editor)
+        rebuildAroundCaret(editor, trigger.tokenLength, text)
       }
 
       finish()
@@ -427,7 +428,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
         try {
           const uploaded = await uploadComposerAttachment(
             { detail: path, id: attachmentId(kind, path), kind, label: pathLabel(path), path },
-            { backendCwd: cwd, remote, requestGateway, sessionId }
+            { backendCwd: cwd, remote, requestGateway, sessionId, terminalBackend: $terminalBackend.get() }
           )
 
           const ref = attachmentDisplayText(uploaded)
@@ -517,16 +518,27 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
     }
   }
 
-  const handleInput = (event: FormEvent<HTMLDivElement>) => {
-    const editor = event.currentTarget
+  const flushEditorToDraft = useCallback(
+    (editor: HTMLDivElement) => {
+      if (editor.childNodes.length === 1 && editor.firstChild?.nodeName === 'BR') {
+        editor.replaceChildren()
+      }
 
-    if (editor.childNodes.length === 1 && editor.firstChild?.nodeName === 'BR') {
-      editor.replaceChildren()
+      rememberInitialDraft()
+      const nextDraft = syncDraftFromEditor(editor)
+      window.setTimeout(refreshTrigger, 0)
+
+      return nextDraft
+    },
+    [refreshTrigger, rememberInitialDraft, syncDraftFromEditor]
+  )
+
+  const handleInput = (event: FormEvent<HTMLDivElement>) => {
+    if (composingRef.current) {
+      return
     }
 
-    rememberInitialDraft()
-    syncDraftFromEditor(editor)
-    window.setTimeout(refreshTrigger, 0)
+    flushEditorToDraft(event.currentTarget)
   }
 
   // Native typing/deleting still goes through Chromium's editing pipeline, whose
@@ -555,12 +567,22 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
     rememberInitialDraft()
     recordUndoPoint()
 
-    // Links land as `@url:` chips, same as the main composer.
-    insertComposerContentsAtCaret(event.currentTarget, pathifyRefs(linkifyUrls(pastedText)))
+    // Links land as `@url:` chips, same as the main composer — including
+    // consuming an open `@url:` scope rather than stacking a second directive
+    // in front of the chip.
+    insertComposerContentsAtCaret(
+      event.currentTarget,
+      pathifyRefs(linkifyUrls(pastedText)),
+      openDirectiveScope(event.currentTarget)
+    )
     syncDraftFromEditor(event.currentTarget)
   }
 
   const submitEdit = (editor: HTMLDivElement) => {
+    if (composingRef.current) {
+      return
+    }
+
     const nextDraft = syncDraftFromEditor(editor)
 
     if (submitting || staging || !nextDraft.trim()) {
@@ -576,6 +598,13 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
     // hazard on the main composer).
     try {
       aui.composer().send()
+
+      // Clear latch after cooldown to allow re-submission. This prevents rapid
+      // double-Enter but doesn't require tracking when onEdit settles (which may
+      // be synchronous or async, and whose promise we don't have access to).
+      window.setTimeout(() => {
+        setSubmitting(false)
+      }, 200)
     } catch {
       setSubmitting(false)
     }
@@ -628,6 +657,24 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   )
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    // Self-heal a stale composition flag (same recovery as the main composer's
+    // handleEditorKeyDown, #44135): compositionend can be missed, and a wedged
+    // composingRef would swallow every Enter until the edit composer remounts.
+    if (composingRef.current && !event.nativeEvent.isComposing) {
+      composingRef.current = false
+    }
+
+    // IME composition: Enter confirms composed text, not a message submission.
+    if (composingRef.current || event.nativeEvent.isComposing) {
+      return
+    }
+
+    // IME commit Enter still carrying keyCode 229 (VK_PROCESSKEY) after
+    // compositionend — same guard as the main composer.
+    if (event.key === 'Enter' && event.keyCode === 229) {
+      return
+    }
+
     if (trigger && triggerItems.length > 0) {
       if (event.key === 'ArrowDown') {
         event.preventDefault()
@@ -734,6 +781,9 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
       <StickyHumanMessageContainer>
         <div
           className="composer-human-message-container human-execution-message-top relative flex w-full items-start rounded-md bg-(--ui-chat-surface-background)"
+          // A raised box over the transcript field: under window glass it keeps
+          // a near-opaque fill instead of thinning with the field behind it.
+          data-glass-raised=""
           onBlur={handleEditBlur}
           onDragEnter={handleDragEnter}
           onDragLeave={handleDragLeave}
@@ -766,8 +816,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
               autoCapitalize="off"
               autoCorrect="off"
               className={cn(
-                'ui-prompt-input-editor__input max-h-48 w-full resize-none bg-transparent p-0 pr-7 text-[length:var(--conversation-text-font-size)] text-foreground/95 outline-none',
-                'empty:before:content-[attr(data-placeholder)] empty:before:text-muted-foreground/60',
+                'ui-prompt-input-editor__input max-h-48 w-full resize-none overflow-y-auto bg-transparent p-0 pr-7 text-[length:var(--conversation-text-font-size)] text-foreground/95 outline-none',
                 '**:data-ref-text:cursor-default',
                 expanded ? 'min-h-16' : 'min-h-[1.25rem]'
               )}
@@ -776,6 +825,13 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
               data-slot={RICH_INPUT_SLOT}
               onBeforeInput={handleBeforeInput}
               onBlur={() => window.setTimeout(closeTrigger, 80)}
+              onCompositionEnd={event => {
+                composingRef.current = false
+                flushEditorToDraft(event.currentTarget)
+              }}
+              onCompositionStart={() => {
+                composingRef.current = true
+              }}
               onDragOver={handleDragOver}
               onDrop={handleDrop}
               onFocus={() => markActiveComposer('edit')}
@@ -789,6 +845,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
               spellCheck={false}
               suppressContentEditableWarning
             />
+            <ComposerDirectiveActions editorRef={editorRef} />
             <ComposerPrimitive.Input
               asChild
               className="sr-only"

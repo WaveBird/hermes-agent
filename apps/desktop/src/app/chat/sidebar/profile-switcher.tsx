@@ -20,7 +20,7 @@ import {
 import { CSS } from '@dnd-kit/utilities'
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 
 import { CodeEditor } from '@/components/chat/code-editor'
 import { Button } from '@/components/ui/button'
@@ -29,6 +29,7 @@ import { ColorSwatches } from '@/components/ui/color-swatches'
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover'
+import { ProfileGlyph } from '@/components/ui/profile-glyph'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tip, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { getProfileSoul, updateProfileSoul } from '@/hermes'
@@ -52,6 +53,7 @@ import {
   $profileScope,
   ALL_PROFILES,
   normalizeProfileKey,
+  profileLabel,
   refreshActiveProfile,
   selectProfile,
   setProfileColor,
@@ -59,14 +61,16 @@ import {
   setShowAllProfiles,
   sortByProfileOrder
 } from '@/store/profile'
+import { runExportProfileFlow, runImportProfileFlow } from '@/store/profile-share'
 import type { ProfileInfo } from '@/types/hermes'
 
 import { CreateProfileDialog } from '../../profiles/create-profile-dialog'
 import { DeleteProfileDialog } from '../../profiles/delete-profile-dialog'
 import { RenameProfileDialog } from '../../profiles/rename-profile-dialog'
-import { PROFILES_ROUTE } from '../../routes'
+import { PROFILES_ROUTE, SETTINGS_ROUTE } from '../../routes'
 
 import { useProfilePrewarm } from './use-profile-prewarm'
+import { useProfileRailRefreshOnActive } from './use-profile-rail-refresh-on-active'
 
 const RAIL_GAP = 4 // px — matches gap-1 between squares.
 
@@ -202,11 +206,13 @@ export function ProfileRail() {
     }
   }
 
-  // Re-pull the running profile + list on mount so a profile created elsewhere
-  // shows up; cheap and best-effort.
-  useEffect(() => {
-    void refreshActiveProfile()
-  }, [])
+  // Re-pull the running profile + list on mount, and again whenever the window
+  // regains focus/visibility -- a profile created, deleted, or renamed by
+  // another surface (Manage Profiles, another window, the CLI) leaves this
+  // rail's cached $profiles stale until something re-fetches it. See
+  // use-profile-rail-refresh-on-active.ts for the extracted (and tested)
+  // wiring.
+  useProfileRailRefreshOnActive()
 
   // Open the create dialog when the `profile.create` hotkey fires (the dialog
   // state lives here, so the global keybind bumps a request atom we watch).
@@ -235,7 +241,7 @@ export function ProfileRail() {
           <ProfilePill
             active={isAll || onDefault}
             glyph={isAll ? 'layers' : 'home'}
-            label={onDefault ? p.showAllProfiles : p.switchToProfile(defaultProfile.name)}
+            label={onDefault ? p.showAllProfiles : p.switchToProfile(profileLabel(defaultProfile))}
             onSelect={() => (onDefault ? setShowAllProfiles(true) : selectProfile(defaultProfile.name))}
           />
         ) : (
@@ -247,7 +253,7 @@ export function ProfileRail() {
         <ProfilePill
           active
           glyph="home"
-          label={defaultProfile.name}
+          label={profileLabel(defaultProfile)}
           onSelect={() => selectProfile(defaultProfile.name)}
         />
       )}
@@ -264,6 +270,7 @@ export function ProfileRail() {
             profiles={named}
           />
           <AddProfileButton label={p.newProfile} onClick={() => setCreateOpen(true)} />
+          <ImportProfileButton label={p.importProfile} />
         </div>
       ) : (
         <div
@@ -288,7 +295,7 @@ export function ProfileRail() {
                       active={!isAll && normalizeProfileKey(profile.name) === activeKey}
                       color={resolveProfileColor(profile.name, colors)}
                       key={profile.name}
-                      label={profile.name}
+                      label={profileLabel(profile)}
                       onDelete={() => setPendingDelete(profile)}
                       onEditSoul={() => setPendingSoul(profile.name)}
                       onRecolor={color => setProfileColor(profile.name, color)}
@@ -302,6 +309,7 @@ export function ProfileRail() {
           )}
 
           <AddProfileButton label={p.newProfile} onClick={() => setCreateOpen(true)} />
+          <ImportProfileButton label={p.importProfile} />
         </div>
       )}
 
@@ -310,6 +318,19 @@ export function ProfileRail() {
           single-profile user must be able to edit the default's persona
           without first creating a throwaway second profile. */}
       <ProfilePill active={false} glyph="ellipsis" label={p.manageProfiles} onSelect={() => navigate(PROFILES_ROUTE)} />
+
+      {/* Multi-gateway discoverability: a plug pinned beside Manage deep-links
+          to Settings → Gateways (the connections registry lives on the unified
+          Gateways page now). The registry (local runtime + remote gateways +
+          Hermes Cloud + SSH) is otherwise buried three levels into Settings,
+          and the rail is exactly where a user looks when they wonder "how do I
+          get my other machine's agents in here". */}
+      <ProfilePill
+        active={false}
+        glyph="plug"
+        label={p.connectGateway}
+        onSelect={() => navigate(`${SETTINGS_ROUTE}?tab=gateway`)}
+      />
 
       {/* Land in the new profile on a fresh chat (selectProfile triggers the
           new-session reset), not stuck on the session you were just in. */}
@@ -325,6 +346,7 @@ export function ProfileRail() {
 
       <RenameProfileDialog
         currentName={pendingRename?.name ?? ''}
+        isDefault={pendingRename?.is_default ?? false}
         onClose={() => setPendingRename(null)}
         onRenamed={refreshActiveProfile}
         open={pendingRename !== null}
@@ -435,6 +457,24 @@ function AddProfileButton({ label, onClick }: { label: string; onClick: () => vo
   )
 }
 
+// Import-archive door beside the "+": adopt a shared profile bundle (theme,
+// skills, layout) as a new profile. Same chrome as AddProfileButton; the whole
+// flow (picker → import → apply overlay → switch) lives in the store.
+function ImportProfileButton({ label }: { label: string }) {
+  return (
+    <Tip label={label}>
+      <button
+        aria-label={label}
+        className="grid size-5 shrink-0 place-items-center rounded-[3px] text-(--ui-text-tertiary) opacity-55 transition hover:bg-(--ui-control-hover-background) hover:text-foreground hover:opacity-100"
+        onClick={() => void runImportProfileFlow()}
+        type="button"
+      >
+        <Codicon name="cloud-download" size="0.75rem" />
+      </button>
+    </Tip>
+  )
+}
+
 // The condensed rail: every named profile in one compact select. The trigger
 // shows the active profile (tinted initial + name); on default/all scope it
 // falls back to the placeholder since the left toggle pill carries that state.
@@ -464,6 +504,7 @@ function ProfileDropdown({
           <ProfileDropdownItem
             color={resolveProfileColor(profile.name, colors)}
             key={profile.name}
+            label={profileLabel(profile)}
             name={profile.name}
           />
         ))}
@@ -474,21 +515,14 @@ function ProfileDropdown({
 
 // One dropdown row per profile — its own component so each row can own a
 // hover-intent prewarm timer (see useProfilePrewarm).
-function ProfileDropdownItem({ color, name }: { color: null | string; name: string }) {
-  const hue = color ?? 'var(--ui-text-quaternary)'
+function ProfileDropdownItem({ color, label, name }: { color: null | string; label: string; name: string }) {
   const { cancelPrewarm, startPrewarm } = useProfilePrewarm(name)
 
   return (
     <SelectItem onPointerEnter={startPrewarm} onPointerLeave={cancelPrewarm} value={name}>
       <span className="flex min-w-0 items-center gap-1.5">
-        <span
-          aria-hidden="true"
-          className="grid size-4 shrink-0 place-items-center rounded-[3px] text-[0.5rem] font-semibold uppercase leading-none"
-          style={{ backgroundColor: profileColorSoft(hue, 22), color: color ?? undefined }}
-        >
-          {name.replace(/[^a-z0-9]/gi, '').charAt(0) || '?'}
-        </span>
-        <span className="truncate">{name}</span>
+        <ProfileGlyph aria-hidden="true" color={color} isDefault={false} name={name} />
+        <span className="truncate">{label}</span>
       </span>
     </SelectItem>
   )
@@ -691,6 +725,10 @@ function ProfileSquare({
           <ContextMenuItem onSelect={onEditSoul}>
             <Codicon name="edit" size="0.875rem" />
             <span>{p.editSoul}</span>
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={() => void runExportProfileFlow(label)}>
+            <Codicon name="package" size="0.875rem" />
+            <span>{p.exportProfile}</span>
           </ContextMenuItem>
           <ContextMenuItem
             className="text-destructive focus:text-destructive"

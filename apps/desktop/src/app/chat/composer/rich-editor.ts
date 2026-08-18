@@ -7,21 +7,84 @@
  * plain-text round-trip.
  */
 import {
-  DIRECTIVE_CHIP_CLASS,
   directiveIconElement,
   directiveIconSvg,
   formatRefValue,
+  refAttrsHtml,
   refChipLabel,
-  slashChipClass,
   type SlashChipKind,
   slashIconElement
 } from '@/components/assistant-ui/directive-text'
+import { referenceKind, referenceRe } from '@/components/assistant-ui/reference-kinds'
 
 import { slashCommandMatches, type SlashCommandScanOptions } from './slash-refs'
 
 export const RICH_INPUT_SLOT = 'composer-rich-input'
 
-export const REF_RE = /@(file|folder|url|image|tool|line|terminal|session):(`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)/g
+/** Chromium's litter: editing beside a `contenteditable=false` chip splits the
+ *  line and leaves zero-length text nodes behind. They render as nothing and
+ *  serialize as nothing, so no reader of the editor should count them. */
+function isEmptyTextNode(node: ChildNode | null): boolean {
+  return node?.nodeType === Node.TEXT_NODE && !node.textContent
+}
+
+/** The node before `node`, stepping over that litter. */
+function meaningfulPreviousSibling(node: ChildNode | null): ChildNode | null {
+  let prev = node?.previousSibling ?? null
+
+  while (isEmptyTextNode(prev)) {
+    prev = prev?.previousSibling ?? null
+  }
+
+  return prev
+}
+
+/** The node after `node`, stepping over that litter. */
+function meaningfulNextSibling(node: ChildNode | null): ChildNode | null {
+  let next = node?.nextSibling ?? null
+
+  while (isEmptyTextNode(next)) {
+    next = next?.nextSibling ?? null
+  }
+
+  return next
+}
+
+/** Keep the `data-empty` marker the placeholder paints on in step with the
+ *  editor root's contents.
+ *
+ *  `:empty` can't be the whole test: a cleared editor keeps a scaffolding <br>
+ *  so the contenteditable doesn't collapse, and that break makes `:empty`
+ *  false. Nor can CSS infer it on its own — a text node is invisible to
+ *  selectors, so `one<br>` and a lone `<br>` are the same shape, and
+ *  `:has(> br:only-child)` would paint the placeholder over the user's text.
+ *  The code that empties the editor is what knows, so it marks it.
+ *
+ *  Zero-length text nodes don't count as contents. Chromium leaves them behind
+ *  whenever an edit lands next to a `contenteditable=false` chip, and counting
+ *  them left an editor the user had emptied looking occupied. */
+export function markEditorEmptiness(editor: HTMLElement) {
+  if (Array.from(editor.childNodes).every(isEmptyTextNode)) {
+    editor.dataset.empty = ''
+  } else {
+    delete editor.dataset.empty
+  }
+}
+
+/** Drop the marker as IME composition starts, before any preedit text lands.
+ *
+ *  Input events during composition are deliberately skipped (they carry
+ *  uncommitted preedit text), so nothing else clears the marker until
+ *  `compositionend` — and the hint would otherwise sit behind the hiragana the
+ *  user is composing. `normalizeComposerEditorDom` restores it if composition
+ *  ends with nothing committed. */
+export function beginComposerComposition(editor: HTMLElement) {
+  delete editor.dataset.empty
+}
+
+/** @see referenceRe — the shared pattern every surface recognises a reference
+ *  with. Module-level `/g` regexes carry `lastIndex`, so call sites reset it. */
+export const REF_RE = referenceRe()
 
 const ESC: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }
 
@@ -60,42 +123,38 @@ export function refChipHtml(kind: string, rawValue: string, displayLabel?: strin
 
   const label = displayLabel || refChipLabel(kind, id)
 
-  return `<span contenteditable="false" title="${escapeHtml(id)}" data-ref-text="${escapeHtml(text)}" data-ref-id="${escapeHtml(id)}" data-ref-kind="${escapeHtml(kind)}" class="${DIRECTIVE_CHIP_CLASS}">${directiveIconSvg(kind)}<span class="truncate">${escapeHtml(label)}</span></span>`
+  return `<span contenteditable="false" title="${escapeHtml(id)}" data-ref-text="${escapeHtml(text)}" data-ref-id="${escapeHtml(id)}" data-ref-kind="${escapeHtml(kind)}" ${refAttrsHtml(kind)}>${directiveIconSvg(kind)}${escapeHtml(label)}</span>`
 }
 
 export function refChipElement(kind: string, rawValue: string, displayLabel?: string) {
   const id = unquoteRef(rawValue)
   const text = `@${kind}:${quoteRefValue(id)}`
   const chip = document.createElement('span')
-  const label = document.createElement('span')
 
   chip.contentEditable = 'false'
   chip.title = id
   chip.dataset.refText = text
   chip.dataset.refId = id
   chip.dataset.refKind = kind
-  chip.className = DIRECTIVE_CHIP_CLASS
-  label.className = 'truncate'
-  label.textContent = displayLabel || refChipLabel(kind, id)
-  chip.append(directiveIconElement(kind), label)
+  chip.className = 'ref'
+  chip.dataset.ref = referenceKind(kind)
+  chip.append(directiveIconElement(kind), document.createTextNode(displayLabel || refChipLabel(kind, id)))
 
   return chip
 }
 
-/** A non-editable pill for a picked slash command (`/skin nous`, `/tropes`).
+/** A non-editable reference for a picked slash command (`/skin nous`, `/tropes`).
  *  `data-ref-text` carries the literal command so `composerPlainText` round-trips
  *  it back to the exact text that gets submitted. */
 export function slashChipElement(command: string, kind: SlashChipKind, label?: string) {
   const chip = document.createElement('span')
-  const text = document.createElement('span')
 
   chip.contentEditable = 'false'
   chip.dataset.refText = command
   chip.dataset.slashKind = kind
-  chip.className = slashChipClass(kind)
-  text.className = 'truncate'
-  text.textContent = label || command
-  chip.append(slashIconElement(kind), text)
+  chip.className = 'ref'
+  chip.dataset.ref = kind
+  chip.append(slashIconElement(kind), document.createTextNode(label || command))
 
   return chip
 }
@@ -167,6 +226,10 @@ export function renderComposerContents(target: HTMLElement, text: string, option
   // typed (`/wor`) and must stay editable. Callers repainting inert text (a
   // restored draft, a sent message opened for edit) pass `trailingCommitted`.
   appendComposerContents(target, text, options)
+
+  // The other writer that reshapes the editor root: painting a restored draft
+  // in clears the marker, clearing back to '' sets it.
+  markEditorEmptiness(target)
 }
 
 /** Caret range when the selection lives inside `editor`; else null. */
@@ -228,8 +291,24 @@ function atTokenBoundary(editor: HTMLElement, range: Range | null): boolean {
  *  — Chromium's editing pipeline is ~O(n²) on large multiline blobs.
  *
  *  The text arrives whole rather than typed, so a `/command` ending it is
- *  complete rather than half-written and chips like the rest. */
-export function insertComposerContentsAtCaret(editor: HTMLElement, text: string) {
+ *  complete rather than half-written and chips like the rest.
+ *
+ *  `consumeBefore` characters immediately before the caret are swallowed by the
+ *  insert. That's how a paste into an open `@url:` scope replaces the scope
+ *  instead of stacking on it (`@url:@url:\`https://…\``). */
+export function insertComposerContentsAtCaret(editor: HTMLElement, text: string, consumeBefore = 0) {
+  const scoped = consumeBefore > 0 ? rangeBeforeCaret(editor, consumeBefore) : null
+
+  if (scoped) {
+    scoped.deleteContents()
+    scoped.collapse(true)
+
+    const selection = window.getSelection()
+
+    selection?.removeAllRanges()
+    selection?.addRange(scoped)
+  }
+
   const hit = composerSelectionRange(editor)
   const fragment = document.createDocumentFragment()
 
@@ -367,7 +446,14 @@ export function replaceBeforeCaret(editor: HTMLElement, length: number, fragment
 /** Backspace at a collapsed caret immediately after a chip: delete the chip AND
  *  the single trailing space we auto-insert after it, atomically — so removing a
  *  directive never strands an orphaned space (the contenteditable-driven cleanup
- *  was unreliable). Returns whether it ran. */
+ *  was unreliable). Returns whether it ran.
+ *
+ *  "Immediately after" has to be read through Chromium's litter. Committing a
+ *  completion empties the typed token's text node rather than removing it, and
+ *  `Range.insertNode` splits around the caret, so the chip routinely sits
+ *  between zero-length text nodes. Reading those as content made the caret look
+ *  like it was after plain text; the delete declined and Chromium's own
+ *  backspace bounced between the leftovers instead of removing the chip. */
 export function deleteChipBeforeCaret(editor: HTMLElement): boolean {
   const hit = composerSelectionRange(editor)
 
@@ -379,16 +465,20 @@ export function deleteChipBeforeCaret(editor: HTMLElement): boolean {
   let chip: ChildNode | null = null
 
   if (startContainer === editor) {
-    chip = startOffset > 0 ? editor.childNodes[startOffset - 1] : null
+    chip = startOffset > 0 ? (editor.childNodes[startOffset - 1] ?? null) : null
+
+    if (isEmptyTextNode(chip)) {
+      chip = meaningfulPreviousSibling(chip)
+    }
   } else if (startContainer.nodeType === Node.TEXT_NODE && startOffset === 0) {
-    chip = startContainer.previousSibling
+    chip = meaningfulPreviousSibling(startContainer as ChildNode)
   }
 
   if (chip?.nodeType !== Node.ELEMENT_NODE || !(chip as HTMLElement).dataset.refText) {
     return false
   }
 
-  const after = chip.nextSibling
+  const after = meaningfulNextSibling(chip)
   chip.remove()
 
   // Drop the auto-inserted trailing space; keep any real following text.
@@ -466,6 +556,15 @@ export function composerPlainText(node: Node): string {
 
   if (el.dataset.refText) {
     return el.dataset.refText
+  }
+
+  // An editor holding nothing but the placeholder <br> is EMPTY. That <br> is
+  // scaffolding normalizeComposerEditorDom adds so the contenteditable keeps
+  // its height — not a line the user typed. Reading it as "\n" is how a
+  // just-cleared composer stayed non-empty: the newline got stashed as the
+  // session's draft and painted back on return.
+  if (el.dataset.slot === RICH_INPUT_SLOT && el.childNodes.length === 1 && el.firstChild?.nodeName === 'BR') {
+    return ''
   }
 
   if (el.tagName === 'BR') {
@@ -617,6 +716,14 @@ function isBlankNode(node: ChildNode | null): boolean {
  *  rendering emits (we use text nodes + <br> + chips). Real <br> line breaks
  *  (Shift+Enter, which sit after actual text) are preserved. */
 export function normalizeComposerEditorDom(editor: HTMLElement) {
+  // Chromium's zero-length text nodes first: every check below reads siblings,
+  // and litter between them makes a chip look like it has text either side.
+  for (const child of Array.from(editor.childNodes)) {
+    if (isEmptyTextNode(child)) {
+      child.remove()
+    }
+  }
+
   // A trailing block wrapper holding only a break/whitespace is the phantom
   // "new line" Chromium adds after a chip on backspace — drop it.
   const tailBlock = editor.lastChild as HTMLElement | null
@@ -658,6 +765,9 @@ export function normalizeComposerEditorDom(editor: HTMLElement) {
   // composer to appear as a tiny dot/pixel. Ensure there's always at least
   // one <br> so the element maintains intrinsic height. The CSS min-height
   // is a belt; the <br> is suspenders — together they prevent the shrink.
+  // That break is also why emptiness has to be marked, not inferred.
+  markEditorEmptiness(editor)
+
   if (editor.childNodes.length === 0) {
     editor.appendChild(document.createElement('br'))
   }
