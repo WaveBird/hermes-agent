@@ -236,7 +236,7 @@ _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
 _MAX_BACKOFF_SECONDS = 60
 _RECYCLED_RECONNECT_TIMEOUT = 15.0
 # Parked servers (tools deregistered) self-probe on this cadence: nothing else can revive them.
-_PARKED_RETRY_INTERVAL = 300
+_PARKED_RETRY_INTERVAL = 5
 # Bounded wait for a respawned stdio child when a call finds it dead (gateway restarts kill
 # every MCP child); bounded so a broken server still parks via run()'s rapid-drop budget.
 _STDIO_RESPAWN_WAIT_SEC = 15.0
