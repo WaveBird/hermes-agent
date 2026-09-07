@@ -563,6 +563,16 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
             msg = msg[:17] + "..."
         return f"to {target}: \"{msg}\""
 
+    # ssh 插件工具: 执行行前置目标主机 (布布要求 🔌 行可见机器名, 如 [gz])
+    if tool_name in {"ssh_exec", "ssh_connect", "ssh_disconnect"}:
+        tgt = _oneline(str(args.get("target") or "")) or "?"
+        if tool_name == "ssh_disconnect" and not args.get("command"):
+            return tgt
+        cmd = _oneline(str(args.get("command") or ""))
+        if len(cmd) > 30:
+            cmd = cmd[:27] + "..."
+        return f"[{tgt}] {cmd}" if cmd else tgt
+
     if tool_name == "skill_view":
         name = _oneline(str(args.get("name") or ""))
         file_path = args.get("file_path")
