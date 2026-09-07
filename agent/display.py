@@ -460,6 +460,16 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
     if not args:
         return None
     args = redact_tool_args_for_display(tool_name, args) or args
+    # ssh 插件工具: 执行行前置目标主机 (布布要求 🔌 行可见机器名, 如 [gz])
+    if tool_name in {"ssh_exec", "ssh_connect", "ssh_disconnect"}:
+        tgt = _oneline(str(args.get("target") or "")) or "?"
+        if tool_name == "ssh_disconnect" and not args.get("command"):
+            return tgt
+        cmd = _oneline(str(args.get("command") or ""))
+        if len(cmd) > 30:
+            cmd = cmd[:27] + "..."
+        return f"[{tgt}] {cmd}" if cmd else tgt
+
     builder = _PREVIEW_BUILDERS.get(tool_name)
     if builder is not None:
         return builder(args, max_len)
