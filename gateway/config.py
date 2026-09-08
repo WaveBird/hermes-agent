@@ -539,6 +539,10 @@ _TOPLEVEL_BOOL_DEFAULTS = {
 class GatewayConfig:
     """Main gateway configuration: platform connections, session policies, delivery settings."""
     platforms: Dict[Platform, PlatformConfig] = field(default_factory=dict)
+    # Session reset policies
+    default_reset_policy: SessionResetPolicy = field(default_factory=SessionResetPolicy)
+    reset_by_type: Dict[str, SessionResetPolicy] = field(default_factory=dict)
+    reset_by_platform: Dict[Platform, SessionResetPolicy] = field(default_factory=dict)
     reset_triggers: List[str] = field(default_factory=lambda: ["/new", "/reset"])
     quick_commands: Dict[str, Any] = field(default_factory=dict)  # slash commands that bypass the agent loop
     sessions_dir: Path = field(default_factory=lambda: get_hermes_home() / "sessions")
@@ -646,10 +650,26 @@ class GatewayConfig:
     def get_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
         return self.platforms[platform].home_channel if self.platforms.get(platform) else None
 
+    def get_reset_policy(
+        self, platform: Optional[Platform] = None, session_type: Optional[str] = None
+    ) -> SessionResetPolicy:
+        """Get the appropriate reset policy for a session.
+
+        Priority: platform override > type override > default
+        """
+        if platform and platform in self.reset_by_platform:
+            return self.reset_by_platform[platform]
+        if session_type and session_type in self.reset_by_type:
+            return self.reset_by_type[session_type]
+        return self.default_reset_policy
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "platforms": {p.value: c.to_dict() for p, c in self.platforms.items()},
             "reset_triggers": self.reset_triggers,
+            "default_reset_policy": self.default_reset_policy.to_dict(),
+            "reset_by_type": {k: v.to_dict() for k, v in self.reset_by_type.items()},
+            "reset_by_platform": {p.value: v.to_dict() for p, v in self.reset_by_platform.items()},
             "quick_commands": self.quick_commands,
             "sessions_dir": str(self.sessions_dir),
             **{name: getattr(self, name) for name in self._SCALAR_DICT_FIELDS},
@@ -743,6 +763,15 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),
+            default_reset_policy=SessionResetPolicy.from_dict(data.get("default_reset_policy", {})),
+            reset_by_type={
+                type_name: SessionResetPolicy.from_dict(policy_data)
+                for type_name, policy_data in _coerce_dict(data.get("reset_by_type", {})).items()
+            },
+            reset_by_platform={
+                p: SessionResetPolicy.from_dict(policy_data)
+                for p, policy_data in _coerce_dict(data.get("reset_by_platform", {})).items()
+            },
         )
 
     def _extra_choice(self, platform: Optional[Platform], key: str, choices: set, default: str) -> Optional[str]:

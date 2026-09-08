@@ -2027,7 +2027,7 @@ def _home_target_env_var(platform_name: str) -> str:
     registry via ``cron.scheduler._resolve_home_env_var``, then falls back
     to ``<PLATFORM>_HOME_CHANNEL`` for unknown names.
     """
-    from cron.scheduler import _resolve_home_env_var
+    from cron.scheduler_delivery import _resolve_home_env_var
 
     resolved = _resolve_home_env_var(platform_name)
     if resolved:
@@ -10793,7 +10793,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
         try:
             from cron.jobs import get_job
-            from cron.scheduler import _resolve_delivery_targets
+            from cron.scheduler_delivery import _resolve_delivery_targets
         except Exception as e:
             logger.debug("Cron interrupt notification unavailable: %s", e)
             return 0
