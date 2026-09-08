@@ -1686,7 +1686,7 @@ def _select_cached_agent_history(
     tool block). Deliberately unpersisted retry scaffolding is ignored.
     """
     if isinstance(live_history, list) and len(live_history) > len(persisted_history):
-        from run_agent import _is_ephemeral_scaffolding
+        from agent.session_persistence import _is_ephemeral_scaffolding
 
         has_unpersisted_row = any(
             isinstance(message, dict)
