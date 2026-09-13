@@ -1,0 +1,49 @@
+# Hermes 用户插件清单 — cc-bridge
+name: cc-bridge
+version: 0.1.0
+description: >-
+  把 Claude Code 桥接到飞书话题。飞书群话题(thread)内用 /cc:* 命令族会长驻一个
+  Claude Code 子进程(stream-json)，话题内所有普通消息直接与 Claude Code 会话交互。
+  默认权限=审批卡，审批卡内带模式切换快捷按钮。绑定表 JSON 持久化，重启恢复。
+author: 小p (for 布布)
+kind: standalone
+
+config_schema:
+  runtime:
+    claude_executable:
+      type: str
+      default: "claude"
+      description: Claude Code CLI 可执行文件路径或命令名
+    default_workdir:
+      type: str
+      default: ""
+      description: 新会话默认工作目录；空则从最近项目/当前用户目录推断
+    mode:
+      type: str
+      default: "default"
+      description: 默认 Claude 权限模式 default|acceptEdits|bypassPermissions|plan
+    replay:
+      type: int
+      default: 10
+      description: /cc:resume 时按最近更新时间展示的最大会话条数
+  bridge:
+    max_threads:
+      type: int
+      default: 8
+      description: 同时活跃的 CC 子进程上限，超出时最闲的自动回收
+    idle_kill_seconds:
+      type: int
+      default: 1800
+      description: 空闲 CC 子进程多少秒后自动结束（0=不回收）
+    show_tool_cards:
+      type: bool
+      default: true
+      description: 是否展示 tool_use 活动卡（命令/文件编辑/工具）
+    stream_cards:
+      type: bool
+      default: true
+      description: 是否用 CardKit 流式卡展示 CC 输出（false=整段发送）
+  data_dir:
+    type: str
+    default: ""
+    description: 绑定表/消息历史存放目录；空=plugins.entries.cc-bridge 下自动创建
