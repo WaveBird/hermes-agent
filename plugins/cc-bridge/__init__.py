@@ -720,8 +720,7 @@ async def _cmd_mode(thread_id: str, chat_id: str, adapter, arg: str) -> None:
         card = cards.build_mode_picker_card(binding.mode, thread_id=binding.thread_id)
         await _send_card(adapter, binding.chat_id, card, thread_id=binding.thread_id)
         return
-    await _set_mode(binding, mode)
-    await _basic_reply(adapter, binding, f"✅ 已切换权限模式为 `{mode}`")
+    await _switch_mode(binding, mode, adapter, chat_id, thread_id)
 
 
 async def _cmd_rewind(thread_id: str, chat_id: str, adapter, arg: str) -> None:
@@ -1697,38 +1696,10 @@ async def _handle_cc_action(cc: Dict[str, Any], thread_id: str, chat_id: str,
                 await _send_to_thread(adapter, chat_id,
                                       f"模式已切换为 `{mode}`（未绑定会话，下次 /cc:new 生效）",
                                       thread_id)
-            elif (_normalize_cc_mode(mode) == "bypassPermissions"
-                  and binding.proc is not None):
-                # bypass 是"出生即定"：CLI 拒绝运行中热切(需 --dangerously-skip-
-                # permissions 启动)。布布拍板 2026-09-14：点 bypass = 杀掉当前
-                # 进程并以 bypassPermissions 重启(resume 同一 CC 会话不丢上下文)。
-                sid0 = binding.active_session_id or ""
-                wd0 = binding.workdir or _default_workdir or str(Path.home())
-                old_proc = binding.proc
-                try:
-                    old_proc.deny_all_permissions()
-                    await old_proc.close()
-                except Exception:  # noqa: BLE001
-                    logger.warning("cc[%s] bypass 重启: 旧进程关闭异常", thread_id,
-                                   exc_info=True)
-                binding.proc = None
-                binding.mode = "bypassPermissions"
-                binding.updated_at = time.time()
-                if _store:
-                    _store.put(binding)
-                await _start_process_for_binding(binding)
-                note = ("⚡ 已按 bypass 模式重启 CC 进程"
-                        + (f"，已恢复会话 {sid0[:8]}…" if sid0 else "")
-                        + "\n💡 bypass 只对新请求生效，请重新发送你的指令")
-                await _send_to_thread(adapter, chat_id, note, thread_id)
             else:
-                await _set_mode(binding, mode)
-                # 若审批卡上切换，同时尝试 approve 当前请求
-                req = cc.get("req")
-                if req and binding.proc and binding.proc.pending_approval:
-                    p = binding.proc.pending_approval
-                    if p.get("req") == req:
-                        await _resolve_permission(thread_id, {"req": req}, approved=True)
+                req = cc.get("req") or ""
+                await _switch_mode(binding, mode, adapter, chat_id, thread_id,
+                                  resolve_req=req)
         elif action == cards.CC_ACTION_SESSION_OPEN:
             # DM /cc:status 点击未关联话题的 CC 会话 → 新建话题并接入（布布 2026-09-14）
             sid = (cc.get("cc_session_id") or "").strip()
@@ -1820,6 +1791,75 @@ def _normalize_cc_mode(mode: str) -> str:
     return aliases.get(m.lower(), "default")
 
 
+def _needs_restart_for_mode(old_mode: str, new_mode: str) -> bool:
+    """判断模式切换是否需要重启 CC 进程。
+
+    bypass ↔ 非 bypass 必须重启：
+    - 切到 bypass：CLI 拒绝运行中热切到 --dangerously-skip-permissions，
+      且 can_use_tool 回调优先级高于 permission_mode，热切后 bypass 被架空。
+    - 切离 bypass：bypass 进程的 can_use_tool 直接放行(不走审批卡)，
+      热切回 default 后审批回调仍不会生效，必须重启恢复完整审批流程。
+    - 非 bypass 之间(default↔acceptEdits↔plan)：SDK set_permission_mode 可用，无需重启。
+    """
+    old = _normalize_cc_mode(old_mode)
+    new = _normalize_cc_mode(new_mode)
+    bypass = "bypassPermissions"
+    return (old == bypass) != (new == bypass)
+
+
+async def _switch_mode(binding: CCBinding, mode: str,
+                       adapter, chat_id: str, thread_id: str,
+                       *, resolve_req: str = "") -> None:
+    """统一模式切换入口：文本命令(/cc:mode)和按钮(CC_ACTION_MODE)共用。
+
+    bypass ↔ 非 bypass 方向 → 重启进程(resume 同一 CC 会话不丢上下文)；
+    非 bypass 之间 → SDK 热切换(set_permission_mode)。
+    """
+    mode = _normalize_cc_mode(mode)
+    old_mode = binding.mode
+    if mode == old_mode:
+        await _send_to_thread(adapter, chat_id,
+                              f"当前已是 `{mode}` 模式，无需切换。",
+                              thread_id)
+        return
+
+    if _needs_restart_for_mode(old_mode, mode):
+        sid0 = binding.active_session_id or ""
+        # 关旧进程
+        old_proc = binding.proc
+        if old_proc is not None:
+            try:
+                old_proc.deny_all_permissions()
+                await old_proc.close()
+            except Exception:  # noqa: BLE001
+                logger.warning("cc[%s] %s→%s 重启: 旧进程关闭异常",
+                               thread_id, old_mode, mode, exc_info=True)
+        binding.proc = None
+        binding.mode = mode
+        binding.updated_at = time.time()
+        if _store:
+            _store.put(binding)
+        # 以新模式重启，resume 同一 CC 会话
+        await _start_process_for_binding(binding)
+        arrow = f"{old_mode} → {mode}"
+        note = (f"⚡ 已重启 CC 进程（{arrow}）"
+                + (f"，已恢复会话 {sid0[:8]}…" if sid0 else "")
+                + "\n💡 模式切换只对新请求生效，请重新发送你的指令")
+        await _send_to_thread(adapter, chat_id, note, thread_id)
+    else:
+        # 非 bypass 之间：SDK 热切换
+        await _set_mode(binding, mode)
+        await _send_to_thread(adapter, chat_id,
+                              f"✅ 已切换权限模式为 `{mode}`（热切换，无需重启）",
+                              thread_id)
+
+    # 审批卡上切换并放行当前请求（按钮路径）
+    if resolve_req and binding.proc and binding.proc.pending_approval:
+        p = binding.proc.pending_approval
+        if p.get("req") == resolve_req:
+            await _resolve_permission(thread_id, {"req": resolve_req}, approved=True)
+
+
 async def _set_mode(binding: CCBinding, mode: str) -> None:
     """切换权限模式：更新绑定 + 如进程运行则通知 SDK 热切换。
 
@@ -1829,7 +1869,7 @@ async def _set_mode(binding: CCBinding, mode: str) -> None:
     mode = _normalize_cc_mode(mode)
     old_mode = binding.mode
     binding.mode = mode
-    binding.updated_at = __import__("time").time()
+    binding.updated_at = time.time()
     if _store:
         _store.put(binding)
     proc = binding.proc
@@ -1840,7 +1880,7 @@ async def _set_mode(binding: CCBinding, mode: str) -> None:
             logger.warning("cc: set_mode %s rejected (%s)，回滚为 %s",
                            mode, exc, old_mode)
             binding.mode = _normalize_cc_mode(old_mode)
-            binding.updated_at = __import__("time").time()
+            binding.updated_at = time.time()
             if _store:
                 _store.put(binding)
 
