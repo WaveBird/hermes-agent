@@ -90,14 +90,20 @@ class _StreamSession:
         注意：send_streaming_card 内部走 message.create——带 metadata.thread_id
         会触发 create(receive_id_type=thread_id)，该路径实测被飞书拒绝
         （99992402）。因此这里先解析话题锚点，用 reply_to 定位到线程内。
+
+        所有流式卡内容头部加 💠 Claude Code 来源标识。
         """
         if not _stream_cards:
             return
+        _cc_tag = _SOURCE_TAGS.get("cc", "")
         try:
             anchor = await _thread_anchor(self.adapter, self.chat_id, self.thread_id)
+            display = first_text or "💭 思考中..."
+            if _cc_tag:
+                display = f"{_cc_tag}\n\n{display}"
             result = await self.adapter.send_streaming_card(
                 self.chat_id,
-                first_text or "💭 思考中...",
+                display,
                 reply_to=anchor,
                 metadata={"thread_id": self.thread_id} if anchor else None,
             )
@@ -1311,8 +1317,20 @@ def _build_markdown_post_payload(text: str) -> str:
     return json.dumps({"zh_cn": {"content": rows}}, ensure_ascii=False)
 
 
-async def _send_to_thread(adapter, chat_id: str, text: str, thread_id: str) -> Any:
+_SOURCE_TAGS = {
+    "bridge": "🤖 **cc-bridge**",
+    "cc": "💠 **Claude Code**",
+}
+
+
+async def _send_to_thread(adapter, chat_id: str, text: str, thread_id: str,
+                          *, source: str = "bridge") -> Any:
     """把文本/卡片消息送进话题线程。
+
+    ``source`` 决定消息头部来源标识：
+    - ``"bridge"``(默认) → 🤖 cc-bridge（桥接管理消息）
+    - ``"cc"``           → 💠 Claude Code（CC 回复）
+    - ``""``             → 不加标识
 
     飞书的 ``message.create(receive_id_type=thread_id)`` 实测返回 99992402
     field validation failed（即便 receive_id 是真实的 omt_ 线程 ID）——
@@ -1322,9 +1340,12 @@ async def _send_to_thread(adapter, chat_id: str, text: str, thread_id: str) -> A
 
     渲染规则(2026-09-13 实测定死): 有锚点优先走 **post 富文本 md 元素**
     ——与私聊 render 完全同源, 标准全量 markdown; 仅当无锚点或 post 被 API
-    拒绝时降级 interactive 卡(lark_md 残缺子集), 最后才是纯 text。
+    拒绝时降级 interactive 卡(lark_md 樋缺子集), 最后才是纯 text。
     """
     anchor = await _thread_anchor(adapter, chat_id, thread_id)
+    _tag = _SOURCE_TAGS.get(source, "")
+    if _tag:
+        text = f"{_tag}\n\n{text}"
 
     def _note(resp) -> Any:
         # 记录该话题最后一条成功回复的 message_id（占用跳转锚点用）
@@ -1444,7 +1465,7 @@ async def _push_text(binding: CCBinding, text: str, *, allow_stream: bool, final
             _STATE.get("streams", {}).pop(binding.thread_id, None)
             if text.strip():
                 resp = await _send_to_thread(adapter, binding.chat_id, text,
-                                             binding.thread_id)
+                                             binding.thread_id, source="cc")
                 ok = bool(getattr(getattr(resp, "data", None), "message_id", ""))
                 if resp is not None and not ok:
                     logger.warning("cc: thread send rejected (code=%s msg=%s)",
@@ -1669,7 +1690,7 @@ async def _complete_tool_card(binding: CCBinding, tool_use_id: str, is_error: bo
     card = {
         "config": {"wide_screen_mode": True},
         "header": {
-            "title": {"tag": "plain_text", "content": f"{icon} {cards.tool_icon(name)} {name} · {title_word}"},
+            "title": {"tag": "plain_text", "content": f"💠 {icon} {cards.tool_icon(name)} {name} · {title_word}"},
             "template": "red" if is_error else "green",
         },
         "elements": [{"tag": "markdown", "content": (f"**{icon} `{name}` 执行{title_word}**{extra}")[:4000]}],
@@ -2128,6 +2149,7 @@ async def _basic_reply(adapter, binding: Optional[CCBinding], text: str) -> None
         return
     # 统一走话题投递: 带 thread_id 的 create(receive_id_type=thread_id) 会被飞书
     # 拒绝(99992402), 必须经锚点 reply 落线程 —— 直发只会静默丢失。
+    # 默认 source="bridge" 加 🤖 cc-bridge 来源标识
     return await _send_to_thread(
         adapter, binding.chat_id, text, binding.thread_id)
 

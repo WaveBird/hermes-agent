@@ -30,7 +30,7 @@ def _btn(text: str, value: Dict[str, Any], btn_type: str = "default") -> Dict[st
 
 def build_workdir_card(
     workspaces: List[Dict[str, str]],
-    header_title: str = "创建 Claude Code 会话",
+    header_title: str = "🤖 cc-bridge · 创建 Claude Code 会话",
     note: str = "点击目录直接在该话题启动会话：",
     thread_id: str = "",
 ) -> Dict[str, Any]:
@@ -69,7 +69,7 @@ def build_session_picker_card(
     occupied_map: Optional[Dict[str, str]] = None,
     thread_id: str = "",
     chat_id: str = "",
-    header_title: str = "恢复 Claude Code 会话",
+    header_title: str = "🤖 cc-bridge · 恢复 Claude Code 会话",
 ) -> Dict[str, Any]:
     """CC 会话选择卡（/resume 无参）。
 
@@ -259,7 +259,7 @@ CC_ACTION_SESSION_OPEN = "cc_session_open"
 
 def build_status_block_card(
     blocks: List[Dict[str, Any]],
-    header_title: str = "Claude Code 会话",
+    header_title: str = "🤖 cc-bridge · Claude Code 会话",
 ) -> Dict[str, Any]:
     """DM /cc:status 全局总览卡（CardKit 2.0 伪表格版，布布 2026-09-14）。
 
