@@ -19,6 +19,7 @@ import re
 import sys
 import textwrap
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import cards
@@ -43,6 +44,8 @@ _reaper_started: bool = False
 _STATE = {
     "store": None,
     "streams": {},       # thread_id -> _StreamSession (流式卡状态)
+    "pending_name": {},  # thread_id -> /new 暂存的名字
+    "sid_announced": {}, # thread_id -> True (session id 已补发)
 }
 
 # fire-and-forget 任务的强引用集：asyncio 仅弱引用 task，
@@ -220,7 +223,7 @@ async def ensure_cc_session(binding: CCBinding) -> bool:
     if binding.proc is not None and binding.proc.running:
         _fail_counts.pop(binding.thread_id, None)
         return True
-    sid = (binding.cc_session_id or "").strip()
+    sid = (binding.active_session_id or "").strip()
     if not sid:
         return False                      # 从未有过会话：不算失败，交上层引导 /new
     if _fail_counts.get(binding.thread_id, 0) >= _FAIL_THRESH:
@@ -731,7 +734,7 @@ async def _cmd_rewind(thread_id: str, chat_id: str, adapter, arg: str) -> None:
     """/cc:rewind [N|list] — 恢复文件到第 N 条用户消息之前(无参=列出检查点)。"""
     binding = _store.get(thread_id)
     if not binding or not await ensure_cc_session(binding):
-        if binding and binding.cc_session_id:
+        if binding and binding.active_session_id:
             await _basic_reply(adapter, binding,
                                "⚠️ Claude Code 会话恢复失败，试试 /resume 或 /cc:new。")
         else:
@@ -780,7 +783,7 @@ async def _cmd_stop(thread_id: str, chat_id: str, adapter) -> None:
                               "当前没有运行中的 Claude Code 会话。", thread_id)
         return
     if not await ensure_cc_session(binding):
-        if not binding.cc_session_id:
+        if not binding.active_session_id:
             await _send_to_thread(adapter, chat_id,
                                   "当前没有运行中的 Claude Code 会话。", thread_id)
             return
@@ -1942,7 +1945,7 @@ async def _route_to_cc(binding: CCBinding, text: str, gateway, source,
                        *, message_id: str = "") -> None:
     if not await ensure_cc_session(binding):
         # 有历史 session 但恢复失败（或已判失效）：提示一次，不无限重试
-        if binding.cc_session_id and not (binding.proc and binding.proc.running):
+        if binding.active_session_id and not (binding.proc and binding.proc.running):
             adapter = _get_adapter(gateway)
             fails = _fail_counts.get(binding.thread_id, 0)
             tip = ("⚠️ Claude Code 会话恢复失败"
@@ -2123,7 +2126,3 @@ async def _basic_reply(adapter, binding: Optional[CCBinding], text: str) -> None
 def uuid4() -> str:
     import uuid
     return str(uuid.uuid4())
-
-
-# 解决 _push_text 里对 Path 的引用（_handle_cc_action 用到了）
-from pathlib import Path  # noqa: E402
