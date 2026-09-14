@@ -1167,19 +1167,29 @@ def _usage_tail(result_msg: Any) -> str:
     usage = getattr(result_msg, "usage", None)
     cost = getattr(result_msg, "total_cost_usd", None)
 
-    def _g(src: Any, name: str) -> int:
+    # CC SDK usage dict 用 camelCase（inputTokens/outputTokens/cacheReadInputTokens），
+    # 但部分 provider 可能用 snake_case —— 两种都查
+    def _g(src: Any, *names: str) -> int:
+        v = None
         if isinstance(src, dict):
-            v = src.get(name)
-        else:
-            v = getattr(src, name, None) if src is not None else None
+            for n in names:
+                v = src.get(n)
+                if v is not None:
+                    break
+        elif src is not None:
+            for n in names:
+                v = getattr(src, n, None)
+                if v is not None:
+                    break
         return int(v) if isinstance(v, (int, float)) else 0
 
     def _n(v: int) -> str:
         return f"{v:,}" if v < 10000 else (f"{v/1000:.1f}k" if v < 1000000 else f"{v/1000000:.2f}M")
 
-    inp = _g(usage, "input_tokens")
-    out = _g(usage, "output_tokens")
-    cache_r = _g(usage, "cache_read_input_tokens")
+    inp = _g(usage, "input_tokens", "inputTokens")
+    out = _g(usage, "output_tokens", "outputTokens")
+    cache_r = _g(usage, "cache_read_input_tokens", "cacheReadInputTokens",
+                  "cache_read_tokens", "cacheReadTokens")
     parts = []
     if inp or out:
         pieces = [f"↑{_n(inp)}", f"↓{_n(out)}"]
