@@ -520,6 +520,8 @@ async def _cmd_cd(thread_id: str, adapter, arg: str) -> None:
     binding.visited_sessions = []   # 旧目录会话会话集不再适用
     binding.topic_title = ""
     binding.updated_at = time.time()
+    # 重置补发标记，让新目录首轮回捕后重新补发 session id
+    _STATE.setdefault("sid_announced", {}).pop(thread_id, None)
     await _start_process_for_binding(binding)
     _store.put(binding)
     await _basic_reply(adapter, binding, f"✅ 已切换工作目录到 `{newdir}`")
@@ -542,9 +544,11 @@ async def _cmd_reset(thread_id: str, chat_id: str, adapter) -> None:
     # 释放旧 active 会话的全局占用（供其他话题 resume）——须在清空 active 之前
     if _registry is not None and binding.active_session_id:
         _registry.release(binding.active_session_id, thread_id)
-    binding.cc_session_id = ""  # 真实 id 由 SystemMessage 回捕；空值=不 resume
+    binding.active_session_id = ""  # 真实 id 由回捕写入；空值=不 resume
     binding.topic_title = ""  # 新会话清空旧主题
-    binding.updated_at = __import__("time").time()
+    binding.updated_at = time.time()
+    # 重置补发标记，让首轮回捕后重新补发 session id
+    _STATE.setdefault("sid_announced", {}).pop(thread_id, None)
     await _start_process_for_binding(binding)
     _store.put(binding)
     await _send_to_thread(adapter, chat_id,
@@ -801,9 +805,12 @@ async def _cmd_stop(thread_id: str, chat_id: str, adapter) -> None:
         except Exception:  # noqa: BLE001
             logger.warning("cc[%s] /stop 确认消息异常", thread_id, exc_info=True)
     else:
+        # 进程不在运行：释放占用锁，避免其他话题 /resume 被卡
+        if _registry is not None and binding.active_session_id:
+            _registry.release(binding.active_session_id, thread_id)
         await _basic_reply(
             adapter, binding,
-            "会话进程刚被拉起（可能未稳定），稍后再试或用 /status 查看。")
+            "⚠️ 会话进程未在运行，已释放占用。用 /status 查看，或 /reset 重开。")
 
 
 def _project_display_name(workdir: str) -> str:
