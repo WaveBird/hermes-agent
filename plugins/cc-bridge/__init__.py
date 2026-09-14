@@ -934,6 +934,10 @@ async def _start_session(thread_id: str, chat_id: str, adapter, workdir: str,
         binding.chat_id = chat_id
         binding.workdir = wd
         binding.mode = mode or binding.mode
+        # /cc:new = 新建会话：清掉旧 active_session_id，避免
+        # _start_process_for_binding 拿旧 id 走 resume 恢复上下文
+        if not cc_session_id:
+            binding.active_session_id = ""
     # 新会话 naming（需要真正新建时才用）。框架启动后会回捕真实 id 到 active。
     if session_name:
         _STATE.setdefault("pending_name", {})[thread_id] = session_name
