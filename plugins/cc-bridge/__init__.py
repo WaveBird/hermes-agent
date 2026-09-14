@@ -938,6 +938,8 @@ async def _start_session(thread_id: str, chat_id: str, adapter, workdir: str,
         # _start_process_for_binding 拿旧 id 走 resume 恢复上下文
         if not cc_session_id:
             binding.active_session_id = ""
+            # 重置 session id 补发标记，让首次对话后重新补发
+            _STATE.setdefault("sid_announced", {}).pop(thread_id, None)
     # 新会话 naming（需要真正新建时才用）。框架启动后会回捕真实 id 到 active。
     if session_name:
         _STATE.setdefault("pending_name", {})[thread_id] = session_name
@@ -945,20 +947,12 @@ async def _start_session(thread_id: str, chat_id: str, adapter, workdir: str,
     binding.updated_at = _t.time()
     await _start_process_for_binding(binding)
     _store.put(binding)
-    # session id 异步回捕（SDK SystemMessage/ResultMessage 才带），
-    # 短暂等待（最多 3s）让回捕有机会落地，打印到提示里
-    sid_new = binding.active_session_id
-    if not sid_new:
-        for _ in range(15):  # 15 × 0.2s = 3s
-            await asyncio.sleep(0.2)
-            if binding.active_session_id:
-                sid_new = binding.active_session_id
-                break
+    # session id 在首次对话 ResultMessage 里才回捕（connect 不发消息），
+    # /new 时如实告知"会话已就绪"，首次对话后自动补发 session id
     name_txt = f"，名称：`{session_name}`" if session_name else ""
-    sid_txt = f"，session：`{sid_new[:12]}…`" if sid_new else ""
     await _send_to_thread(
         adapter, chat_id,
-        f"🚀 已新建 Claude Code 会话（工作目录：`{wd}`，模式：`{binding.mode}`{name_txt}{sid_txt}）。"
+        f"🚀 已新建 Claude Code 会话（工作目录：`{wd}`，模式：`{binding.mode}`{name_txt}）。"
         "直接在这个话题下发消息即可与其交互。",
         thread_id)
 
@@ -1106,6 +1100,7 @@ async def _on_cc_event(binding: CCBinding, msg: Any) -> None:
         # 真实 CC session id 回捕（resume 关键；SystemMessage 无此字段，
         # ResultMessage/AssistantMessage 才带）
         sid = getattr(msg, "session_id", None) or ""
+        sid_just_captured = False
         if sid and sid != binding.active_session_id:
             # 回捕: 记录到全局 registry + visited，供 /resume 列表与并发锁
             _record_new_session(binding, sid)
@@ -1114,6 +1109,7 @@ async def _on_cc_event(binding: CCBinding, msg: Any) -> None:
                 binding.visited_sessions.insert(0, sid)
             if _store:
                 _store.put(binding)
+            sid_just_captured = True
         result_text = getattr(msg, "result", None) or ""
         usage_tail = _usage_tail(msg)
         err_mark = "\n\n> ⚠️ 本轮返回出错" if bool(getattr(msg, "is_error", False)) else ""
@@ -1132,6 +1128,15 @@ async def _on_cc_event(binding: CCBinding, msg: Any) -> None:
                 binding.topic_title = title
                 if _store:
                     _store.put(binding)
+        # 首轮回捕 session id 时补发提示（/new 时还拿不到）
+        if sid_just_captured and not _STATE.get("sid_announced", {}).get(binding.thread_id):
+            _STATE.setdefault("sid_announced", {})[binding.thread_id] = True
+            adapter = await _current_adapter()
+            if adapter:
+                await _send_to_thread(
+                    adapter, binding.chat_id,
+                    f"📋 CC session id：`{sid[:12]}…`（`/cc:status` 可随时查看）",
+                    binding.thread_id)
         return
 
     # ---- system: 记录 session_id（SystemMessage.data 里可能带）----
