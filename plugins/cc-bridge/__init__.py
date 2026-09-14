@@ -945,10 +945,20 @@ async def _start_session(thread_id: str, chat_id: str, adapter, workdir: str,
     binding.updated_at = _t.time()
     await _start_process_for_binding(binding)
     _store.put(binding)
+    # session id 异步回捕（SDK SystemMessage/ResultMessage 才带），
+    # 短暂等待（最多 3s）让回捕有机会落地，打印到提示里
+    sid_new = binding.active_session_id
+    if not sid_new:
+        for _ in range(15):  # 15 × 0.2s = 3s
+            await asyncio.sleep(0.2)
+            if binding.active_session_id:
+                sid_new = binding.active_session_id
+                break
     name_txt = f"，名称：`{session_name}`" if session_name else ""
+    sid_txt = f"，session：`{sid_new[:12]}…`" if sid_new else ""
     await _send_to_thread(
         adapter, chat_id,
-        f"🚀 已新建 Claude Code 会话（工作目录：`{wd}`，模式：`{binding.mode}`{name_txt}）。"
+        f"🚀 已新建 Claude Code 会话（工作目录：`{wd}`，模式：`{binding.mode}`{name_txt}{sid_txt}）。"
         "直接在这个话题下发消息即可与其交互。",
         thread_id)
 
