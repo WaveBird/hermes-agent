@@ -501,15 +501,6 @@ class CCProcess:
             can_use_tool=_can_use_tool,
             include_partial_messages=True,
             env=env,
-            # 给 CC 注入桥接上下文：用户消息来自飞书话题桥接，
-            # "session"指 CC 会话（~/.claude/projects/），不是 Hermes 的。
-            system_prompt=(
-                "你是在飞书话题内通过 cc-bridge 桥接运行的 Claude Code。\n"
-                "用户消息来自飞书，用户无法直接操作终端。\n"
-                "当用户提到 session/会话时，指的是 Claude Code 的会话"
-                "（~/.claude/projects/ 下的 jsonl），不是 Hermes Agent 的 session。\n"
-                "当用户提到 status/状态时，用 /cc:status 查看，不要去读 ~/.hermes/ 目录。"
-            ),
             # /rewind 支持: 文件检查点 + 用户消息 uuid 回传(replay-user-messages)
             enable_file_checkpointing=True,
             extra_args={"replay-user-messages": None},
