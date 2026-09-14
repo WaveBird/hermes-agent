@@ -739,7 +739,7 @@ async def _cmd_rewind(thread_id: str, chat_id: str, adapter, arg: str) -> None:
                                "⚠️ Claude Code 会话恢复失败，试试 /resume 或 /cc:new。")
         else:
             await _basic_reply(adapter, CCBinding(thread_id=thread_id, chat_id=chat_id,
-                                                  workdir="", mode="default", cc_session_id=""),
+                                                  workdir="", mode="default"),
                                "当前没有 Claude Code 会话。先用 /new <目录> 开一个。")
         return
     cps = getattr(binding.proc, "checkpoints", [])
@@ -766,8 +766,17 @@ async def _cmd_rewind(thread_id: str, chat_id: str, adapter, arg: str) -> None:
     target = cps[n - 1]
     ok = await binding.proc.rewind_files(target["uuid"])
     if ok:
-        # 回滚后该消息之后的检查点作废(会话仍继续, 但文件状态已回到那一步)
-        del binding.proc._checkpoints[n:]
+        # 回滚后该消息之后的检查点作废(会话仍继续, 但文件状态已回到那一步)。
+        # checkpoints property 过滤了未回填 uuid 的条目，cps 序号与
+        # _checkpoints 原始索引不一致，须按 uuid 定位再切。
+        raw = binding.proc._checkpoints
+        target_idx = -1
+        for i, cp in enumerate(raw):
+            if cp["uuid"] == target["uuid"]:
+                target_idx = i
+                break
+        if target_idx >= 0:
+            del raw[target_idx + 1:]
         await _basic_reply(adapter, binding,
                            f"⏪ 已把文件恢复到第 {n} 条消息「{target['text'][:30]}」之前的状态。"
                            "对话上下文未变，如需连同对话一起重置请用 /reset。")
