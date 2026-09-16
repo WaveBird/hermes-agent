@@ -35,6 +35,7 @@ _registry: Optional[SessionRegistry] = None
 _claude_executable: str = "claude"
 _default_workdir: str = ""
 _default_mode: str = "default"
+_backend: str = "sdk"
 _show_tool_cards: bool = True
 _stream_cards: bool = True
 _idle_kill_seconds: int = 0
@@ -170,10 +171,12 @@ def register(ctx) -> None:
     """loader 入口：建 store、读配置、注册 hook。"""
     global _store, _claude_executable, _default_workdir, _default_mode
     global _show_tool_cards, _stream_cards, _idle_kill_seconds
+    global _backend
 
     _claude_executable = str(ctx.get_config("runtime.claude_executable", "claude") or "claude")
     _default_workdir = str(ctx.get_config("runtime.default_workdir", "") or "")
     _default_mode = str(ctx.get_config("runtime.mode", "default") or "default")
+    _backend = str(ctx.get_config("runtime.backend", "sdk") or "sdk")
     _show_tool_cards = bool(ctx.get_config("bridge.show_tool_cards", True))
     _stream_cards = bool(ctx.get_config("bridge.stream_cards", True))
     try:
@@ -191,8 +194,8 @@ def register(ctx) -> None:
         if not _reaper_started:
             _reaper_started = True
             _fire_and_forget(_idle_reaper_loop())
-    logger.info("cc-bridge ready (claude=%s default_mode=%s store=%s)",
-                _claude_executable, _default_mode, _store.dir)
+    logger.info("cc-bridge ready (claude=%s backend=%s default_mode=%s store=%s)",
+                _claude_executable, _backend, _default_mode, _store.dir)
 
 
 async def _idle_reaper_loop() -> None:
@@ -1038,20 +1041,46 @@ async def _start_process_for_binding(binding: CCBinding) -> None:
 
     用 active_session_id 决定 resume 哪个 CC 会话；并在全局 registry 里
     用当前话题占用它（并发锁）。会话空闲时 resume=None 开新会话。
+
+    根据 _backend 配置选择驱动后端：
+    - sdk:  claude-agent-sdk (原生事件流，不支持 TUI 命令)
+    - tmux: tmux 直连驱动真实 CLI
+    - rmux: rmux+librmux 驱动真实 CLI
     """
     sid = binding.active_session_id
     # 占用锁：本话题接管该 CC 会话（即使进程级重启，占用关系不变）
     _acquire_session(binding, sid)
-    proc = CCProcess(
-        binding.workdir,
-        sid or None,          # 空=新会话，不 resume
-        binding.mode,
-        _claude_executable,
+    proc = _create_cc_process(
+        workdir=binding.workdir,
+        session_id=sid or None,          # 空=新会话，不 resume
+        mode=binding.mode,
         on_event=lambda msg: _on_cc_event(binding, msg),
         on_exit=lambda err: _on_cc_exit(binding, err),
     )
     binding.proc = proc
     await proc.start()
+
+
+def _create_cc_process(workdir: str, session_id, mode: str, on_event, on_exit):
+    """根据 _backend 配置创建对应的 CC 进程实例。"""
+    if _backend == "tmux":
+        from .pty_process import CCProcessPty
+        return CCProcessPty(
+            workdir, session_id, mode, _claude_executable,
+            on_event=on_event, on_exit=on_exit,
+        )
+    elif _backend == "rmux":
+        from .pty_rmux_process import CCProcessRmux
+        return CCProcessRmux(
+            workdir, session_id, mode, _claude_executable,
+            on_event=on_event, on_exit=on_exit,
+        )
+    else:
+        # sdk (默认)
+        return CCProcess(
+            workdir, session_id, mode, _claude_executable,
+            on_event=on_event, on_exit=on_exit,
+        )
 
 
 def _acquire_session(binding: CCBinding, session_id: str) -> None:
