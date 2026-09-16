@@ -252,6 +252,47 @@ def mark_session_invalid(thread_id: str) -> None:
     _fail_counts.pop(thread_id, None)
 
 
+async def _auto_recover_session(binding: CCBinding, adapter, chat_id: str) -> bool:
+    """绑定话题收到命令但进程不在时自动恢复或创建 CC 会话。
+
+    返回 True=proc 可用。
+    1) 有 active_session_id → ensure_cc_session 尝试 resume；
+    2) resume 失败或从未有过会话 → 重置并新开一个（保留原 workdir）。
+    """
+    if binding.proc is not None and binding.proc.running:
+        return True
+    if await ensure_cc_session(binding):
+        return True
+    # resume 失败或从未有过会话：重置 binding 并新开
+    old_sid = binding.active_session_id
+    if old_sid and _registry is not None:
+        _registry.release(old_sid, binding.thread_id)
+    binding.active_session_id = ""
+    binding.topic_title = ""
+    binding.updated_at = time.time()
+    _STATE.setdefault("sid_announced", {}).pop(binding.thread_id, None)
+    try:
+        await _start_process_for_binding(binding)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cc[%s] auto-recover new session failed: %s",
+                       binding.thread_id, exc, exc_info=True)
+        if adapter:
+            await _send_to_thread(
+                adapter, chat_id,
+                f"⚠️ 无法启动 Claude Code 会话：{exc}\n"
+                "检查 /cc:new 或稍后重试。",
+                binding.thread_id)
+        return False
+    _store.put(binding)
+    if adapter:
+        await _send_to_thread(
+            adapter, chat_id,
+            f"🔄 Claude Code 会话已自动恢复（工作目录：`{binding.workdir}`）。"
+            + (f"\nℹ️ 旧会话 `{old_sid[:8]}…` resume 失败，已新开一个。" if old_sid else ""),
+            binding.thread_id)
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # pre_gateway_dispatch 钩子
 # --------------------------------------------------------------------------- #
@@ -353,7 +394,7 @@ async def _dispatch_cc_command(cmd_text: str, thread_id: str, chat_id: str,
         if verb == "new":
             await _cmd_new(thread_id, chat_id, adapter, source, arg)
         elif verb == "cd":
-            await _cmd_cd(thread_id, adapter, arg)
+            await _cmd_cd(thread_id, chat_id, adapter, arg)
         elif verb == "reset":
             await _cmd_reset(thread_id, chat_id, adapter)
         elif verb == "resume":
@@ -502,11 +543,18 @@ async def _create_topic_thread(adapter, chat_id: str, anchor_text: str) -> Optio
         return None
 
 
-async def _cmd_cd(thread_id: str, adapter, arg: str) -> None:
+async def _cmd_cd(thread_id: str, chat_id: str, adapter, arg: str) -> None:
     binding = _store.get(thread_id)
-    if not binding or not binding.proc:
-        await _basic_reply(adapter, binding, "当前话题没有活跃 Claude Code 会话。")
+    if not binding:
+        # 无绑定：自动创建会话（用默认目录或 ~）
+        wd = arg.strip() if arg.strip() else (_default_workdir or str(Path.home()))
+        await _start_session(thread_id, chat_id, adapter, wd,
+                             cc_session_id="", mode=_default_mode)
         return
+    if not binding.proc or not binding.proc.running:
+        # 进程不在运行：自动恢复或新开（不报错）
+        if not await _auto_recover_session(binding, adapter, chat_id):
+            return
     if not arg:
         await _basic_reply(adapter, binding, f"当前工作目录：`{binding.workdir}`")
         return
@@ -539,9 +587,10 @@ async def _cmd_cd(thread_id: str, adapter, arg: str) -> None:
 async def _cmd_reset(thread_id: str, chat_id: str, adapter) -> None:
     binding = _store.get(thread_id)
     if not binding:
-        await _send_to_thread(adapter, chat_id,
-                              "该话题没有 Claude Code 会话。使用 /cc:new 创建。",
-                              thread_id)
+        # 无绑定：等价于 /cc:new，自动创建会话
+        wd = _default_workdir or str(Path.home())
+        await _start_session(thread_id, chat_id, adapter, wd,
+                             cc_session_id="", mode=_default_mode)
         return
     # 关旧进程，开新 session（保留话题+workdir）
     old = binding.proc
@@ -724,8 +773,12 @@ async def _cmd_mode(thread_id: str, chat_id: str, adapter, arg: str) -> None:
     binding = _store.get(thread_id)
     if not binding:
         await _send_to_thread(adapter, chat_id,
-                              "当前话题没有 Claude Code 会话。", thread_id)
+                              "当前话题没有 Claude Code 会话。先用 /cc:new `<目录>` 开一个。",
+                              thread_id)
         return
+    if not binding.proc or not binding.proc.running:
+        if not await _auto_recover_session(binding, adapter, chat_id):
+            return
     mode_map = {"default": "default", "accept": "acceptEdits", "acceptEdits": "acceptEdits",
                 "plan": "plan", "bypass": "bypassPermissions", "bypasspermissions": "bypassPermissions"}
     mode = mode_map.get(arg.lower(), "")
@@ -739,15 +792,14 @@ async def _cmd_mode(thread_id: str, chat_id: str, adapter, arg: str) -> None:
 async def _cmd_rewind(thread_id: str, chat_id: str, adapter, arg: str) -> None:
     """/cc:rewind [N|list] — 恢复文件到第 N 条用户消息之前(无参=列出检查点)。"""
     binding = _store.get(thread_id)
-    if not binding or not await ensure_cc_session(binding):
-        if binding and binding.active_session_id:
-            await _basic_reply(adapter, binding,
-                               "⚠️ Claude Code 会话恢复失败，试试 /resume 或 /cc:new。")
-        else:
-            await _basic_reply(adapter, CCBinding(thread_id=thread_id, chat_id=chat_id,
-                                                  workdir="", mode="default"),
-                               "当前没有 Claude Code 会话。先用 /new <目录> 开一个。")
+    if not binding:
+        await _send_to_thread(adapter, chat_id,
+                              "当前话题没有 Claude Code 会话。先用 /cc:new `<目录>` 开一个。",
+                              thread_id)
         return
+    if not binding.proc or not binding.proc.running:
+        if not await _auto_recover_session(binding, adapter, chat_id):
+            return
     cps = getattr(binding.proc, "checkpoints", [])
     if not arg or arg.lower() in ("list", "?"):
         if not cps:
@@ -797,14 +849,13 @@ async def _cmd_stop(thread_id: str, chat_id: str, adapter) -> None:
         await _send_to_thread(adapter, chat_id,
                               "当前没有运行中的 Claude Code 会话。", thread_id)
         return
-    if not await ensure_cc_session(binding):
-        if not binding.active_session_id:
-            await _send_to_thread(adapter, chat_id,
-                                  "当前没有运行中的 Claude Code 会话。", thread_id)
-            return
+    if not binding.proc or not binding.proc.running:
+        # 进程已不在运行：直接释放占用锁，提示用户
+        if _registry is not None and binding.active_session_id:
+            _registry.release(binding.active_session_id, thread_id)
         await _basic_reply(
             adapter, binding,
-            "⚠️ 会话恢复失败，无法发送中断。试试 /cc:new。")
+            "⚠️ 会话进程未在运行，已释放占用。用 /status 查看，或 /reset 重开。")
         return
     proc = binding.proc
     if proc is not None and proc.running:
