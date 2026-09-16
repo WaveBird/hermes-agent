@@ -1129,9 +1129,76 @@ async def _on_cc_event(binding: CCBinding, msg: Any) -> None:
     except Exception:  # noqa: BLE001
         mtype = ""
 
-    # ---- 内部 dict 事件: permission_request（can_use_tool 回调触发）----
+    # ---- 内部 dict 事件 ----
+    # 来源两路：(1) SDK can_use_tool 回调的 permission_request；
+    #          (2) PTY 后端 (tmux/rmux) JSONL tail 的 text/tool_use/tool_result/result。
     if isinstance(msg, dict):
         etype = msg.get("type") or ""
+
+        # PTY: assistant 文本块
+        # JSONL transcript 的 assistant 事件发完整文本段（非 delta），
+        # 直接当 final 落地，不走流式增量（避免与 stop 事件重复）。
+        if etype == "text":
+            text = str(msg.get("text") or "")
+            if text:
+                await _push_text(binding, text, allow_stream=False, final=True)
+            return
+
+        # PTY: tool_use 起始/完整参数 → 发活动卡
+        if etype == "tool_use":
+            await _handle_tool_use(binding, {
+                "id": msg.get("id", ""),
+                "name": msg.get("name", ""),
+                "input": msg.get("input") or {},
+            })
+            return
+
+        # PTY: tool_result → 完成活动卡
+        if etype == "tool_result":
+            tuid = str(msg.get("tool_use_id") or "")
+            content = msg.get("content")
+            is_err = bool(msg.get("is_error", False))
+            if tuid:
+                await _complete_tool_card(binding, tuid, is_err, content)
+            return
+
+        # PTY: result 事件（session_id 回捕 / 一轮结束）
+        if etype == "result":
+            subtype = msg.get("subtype") or ""
+            sid = str(msg.get("session_id") or "")
+
+            # session_id 回捕
+            if subtype == "session_id" and sid:
+                if sid != binding.active_session_id:
+                    _record_new_session(binding, sid)
+                    binding.active_session_id = sid
+                    if sid not in binding.visited_sessions:
+                        binding.visited_sessions.insert(0, sid)
+                    if _store:
+                        _store.put(binding)
+                    # 首次回捕时补发提示（与 SDK 路径一致）
+                    if not _STATE.get("sid_announced", {}).get(binding.thread_id):
+                        _STATE.setdefault("sid_announced", {})[binding.thread_id] = True
+                        adapter = await _current_adapter()
+                        if adapter:
+                            await _send_to_thread(
+                                adapter, binding.chat_id,
+                                f"📋 CC session id：`{sid[:12]}…`（`/cc:status` 可随时查看）",
+                                binding.thread_id)
+                return
+
+            # 一轮结束（文本已在 text 事件中落地，这里只收尾）
+            if subtype == "stop":
+                # 如果有活跃流式卡，做最终收尾；否则 noop
+                stream = _STATE.get("streams", {}).get(binding.thread_id)
+                if stream is not None:
+                    await _finish_stream(binding)
+                _fire_and_forget(_cc_mark_done(binding.thread_id, ok=True))
+                return
+
+            return
+
+        # SDK: permission_request（can_use_tool 回调触发）
         if etype == "permission_request":
             await _handle_permission(binding, msg)
         return
