@@ -413,6 +413,114 @@ class TestBridgeDispatch:
         assert err is not None
         assert "bridge tool" in err.lower()
 
+    def test_resolve_underlying_call_recovers_name_from_arguments(self):
+        """A name folded inside `arguments` is equivalent to the top-level name.
+
+        Some models put the tool name inside the arguments dict (e.g.
+        `arguments={"name": "foo", ...}`) when they mean to call the tool
+        `foo`. The bridge should recover it, treat it as the underlying name,
+        and drop it from the args so the tool's own schema validation doesn't
+        see an unknown `name` parameter.
+        """
+        from tools.registry import registry
+        from tools.tool_search import resolve_underlying_call
+
+        tool_name = "zz_test_bridge_name_in_args"
+        registry.register(
+            name=tool_name,
+            handler=lambda args, **kwargs: "{}",
+            schema=_td(tool_name, "deferrable probe tool"),
+            toolset="mcp-zz-bridge-probe",
+        )
+        underlying, args, err = resolve_underlying_call({
+            # no top-level name — name lives inside arguments
+            "arguments": {"name": tool_name, "target": "byd-54", "command": "echo hi"},
+        })
+        assert err is None
+        assert underlying == tool_name
+        assert args == {"target": "byd-54", "command": "echo hi"}
+        assert "name" not in args
+
+    def test_resolve_underlying_call_unwraps_doubly_nested_arguments(self):
+        """A tool_call can arrive with ``arguments`` folded onto itself (e.g.
+        ``arguments={"arguments": {"name": "foo", ...}}``). The bridge must unwrap
+        every layer, recover the ``name`` from the innermost dict, and strip it."""
+        from tools.registry import registry
+        from tools.tool_search import resolve_underlying_call
+
+        tool_name = "zz_test_bridge_doubly_nested"
+        registry.register(
+            name=tool_name,
+            handler=lambda args, **kwargs: "{}",
+            schema=_td(tool_name, "deferrable probe tool"),
+            toolset="mcp-zz-bridge-probe",
+        )
+        underlying, args, err = resolve_underlying_call({
+            "arguments": {
+                "arguments": {"name": tool_name, "target": "byd-54", "command": "echo hi"},
+            },
+        })
+        assert err is None
+        assert underlying == tool_name
+        assert args == {"target": "byd-54", "command": "echo hi"}
+        assert "name" not in args
+
+    def test_resolve_underlying_call_missing_name_still_rejected(self):
+        """Without a top-level name AND without one inside arguments, the bridge
+        still errors with the original message."""
+        from tools.tool_search import resolve_underlying_call
+        name, args, err = resolve_underlying_call({
+            "arguments": {"command": "echo hi"},
+        })
+        assert err is not None
+        assert "requires a 'name' argument" in err
+        assert name is None
+
+    def test_resolve_underlying_call_top_level_name_wins_over_nested(self):
+        """An explicit top-level name is authoritative; any nested name is dropped
+        as junk rather than overriding it."""
+        from tools.registry import registry
+        from tools.tool_search import resolve_underlying_call
+
+        tool_name = "zz_test_bridge_name_top_wins"
+        registry.register(
+            name=tool_name,
+            handler=lambda args, **kwargs: "{}",
+            schema=_td(tool_name, "deferrable probe tool"),
+            toolset="mcp-zz-bridge-probe",
+        )
+        underlying, args, err = resolve_underlying_call({
+            "name": tool_name,
+            "arguments": {"name": "junk_name", "target": "byd-54"},
+        })
+        assert err is None
+        assert underlying == tool_name
+        assert args == {"target": "byd-54"}
+
+    def test_resolve_underlying_call_top_level_name_unwraps_nested_arguments(self):
+        """Even when a top-level name is present, doubly-nested ``arguments`` must
+        still be unwrapped so the underlying tool receives its real parameters and
+        not an ``arguments`` wrapper object."""
+        from tools.registry import registry
+        from tools.tool_search import resolve_underlying_call
+
+        tool_name = "zz_test_bridge_top_name_nested_args"
+        registry.register(
+            name=tool_name,
+            handler=lambda args, **kwargs: "{}",
+            schema=_td(tool_name, "deferrable probe tool"),
+            toolset="mcp-zz-bridge-probe",
+        )
+        underlying, args, err = resolve_underlying_call({
+            "name": tool_name,
+            "arguments": {
+                "arguments": {"target": "byd-54", "command": "echo hi"},
+            },
+        })
+        assert err is None
+        assert underlying == tool_name
+        assert args == {"target": "byd-54", "command": "echo hi"}
+
 
 # ---------------------------------------------------------------------------
 # End-to-end via the real handle_function_call (smoke test).

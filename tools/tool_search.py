@@ -464,12 +464,13 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
 
 def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
     """Parse a ``tool_call`` invocation -> (underlying_name, args, error_msg); ``(None, {}, msg)``
-    on error. Shared by dispatch, display and the trajectory recorder so all three agree."""
+    on error. Shared by dispatch, display and the trajectory recorder so all three agree.
+
+    ``name`` normally sits at the top level of the bridge call. As a tolerance for models that
+    fold the tool name inside ``arguments`` (e.g. ``arguments={"name": "foo", ...}``), a missing
+    top-level ``name`` is recovered from ``arguments`` — the recovered name is then removed so the
+    underlying tool's schema sees only its own parameters."""
     name = str(args.get("name") or "").strip()
-    if not name:
-        return None, {}, "tool_call requires a 'name' argument"
-    if name in BRIDGE_TOOL_NAMES:
-        return None, {}, f"tool_call cannot invoke '{name}' (it is itself a bridge tool)"
     raw_args = args.get("arguments")
     if isinstance(raw_args, str):
         try:
@@ -479,11 +480,40 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
     raw_args = {} if raw_args is None else raw_args
     if not isinstance(raw_args, dict):
         return None, {}, "tool_call 'arguments' must be an object"
+    # A tool name or parameter dict can arrive wrapped in one or more extra
+    # ``arguments`` layers (model serialization folds the bridge's ``arguments``
+    # onto itself). Unwrap until the real parameter object is reached, capturing
+    # any ``name`` encountered along the way. ``name`` folded in ``arguments`` is
+    # not a parameter of the underlying tool, so it is stripped from the the args
+    # handed to schema validation / the handler. An explicit top-level ``name``
+    # takes precedence.
+    bottom = raw_args
+    seen = 0
+    while isinstance(bottom, dict) and "arguments" in bottom and seen < 8:
+        sub = bottom.get("arguments")
+        sub = json.loads(sub) if isinstance(sub, str) else sub
+        if not isinstance(sub, dict):
+            break
+        nested = str(bottom.get("name") or "").strip()
+        if nested and not name:
+            name = nested
+        bottom = sub
+        seen += 1
+    if not name:
+        nested = str(bottom.get("name") or "").strip()
+        if nested:
+            name = nested
+    if "name" in bottom and isinstance(bottom, dict):
+        bottom = {k: v for k, v in bottom.items() if k != "name"}
+    if not name:
+        return None, {}, "tool_call requires a 'name' argument"
+    if name in BRIDGE_TOOL_NAMES:
+        return None, {}, f"tool_call cannot invoke '{name}' (it is itself a bridge tool)"
     if not is_deferrable_tool_name(name, load_config_readonly().effective_defer_tools):
         return None, {}, (
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
             "list already, call it directly instead of via tool_call.")
-    return name, raw_args, None
+    return name, bottom, None
 
 
 __all__ = [
