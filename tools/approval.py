@@ -796,7 +796,8 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
-                    is_ask: bool, smart: bool = False, pending_body=None) -> dict:
+                    is_ask: bool, smart: bool = False, pending_body=None,
+                    tool_tag: str = "") -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``pattern_keys`` are what :func:`_persist_choice` stores on session/always; a smart-DENY
@@ -866,6 +867,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             }
             if smart_denied:
                 data["smart_denied"] = True
+            if tool_tag:
+                data["tool_tag"] = str(tool_tag)
             decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway")
             if decision.get("notify_failed"):
                 return _denied(spec.notify_failed, pattern_key=pattern_key,
@@ -1150,10 +1153,13 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             tool_tag: str = "") -> dict:
     """Run all pre-exec security checks and return a single approval decision. Plugins that
     want to veto or escalate a command do it from ``pre_tool_call``.
-    ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
+    ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow.
+    ``tool_tag``: optional short label for the calling tool (e.g. ``SSH·gz``); it rides through
+    the gateway approval payload so the prompt can show where the command came from."""
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return _user_deny_block(command) or _approved()
 
@@ -1191,6 +1197,7 @@ def check_all_command_guards(command: str, env_type: str,
         pattern_key=pattern_key, pattern_keys=[pattern_key],
         session_key=session_key, approval_callback=approval_callback,
         is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
+        tool_tag=tool_tag,
     )
 
 

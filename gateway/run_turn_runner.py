@@ -686,6 +686,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Redact credentials before display: the raw command string can carry secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))
         desc = approval_data.get("description") or ea_default_reason_text()
+        # Which tool asked (e.g. "SSH·gz") — shown in the prompt and the card header.
+        tool_tag = str(approval_data.get("tool_tag") or "").strip()
+        if tool_tag:
+            desc = f"[{tool_tag}] {desc}"
         flags = {k: approval_data.get(k, d) for k, d in (("allow_permanent", True), ("allow_session", True), ("smart_denied", False))}
         # Check the *class*, not the instance — MagicMock auto-creates attributes in tests.
         if _renders_exec_approval_buttons(type(adapter)):
@@ -694,6 +698,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     adapter.send_exec_approval(
                         chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
                         description=desc, metadata=ctx._status_thread_metadata, **flags,
+                        source_tag=tool_tag or None,
                     ),
                     "send_exec_approval scheduling error",
                 )
