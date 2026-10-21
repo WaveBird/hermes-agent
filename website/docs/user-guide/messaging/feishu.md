@@ -6,6 +6,10 @@ description: "Set up Hermes Agent as a Feishu or Lark bot"
 
 # Feishu / Lark Setup
 
+Python dependency commands on this page use a
+[PM-prepared source checkout](../../reference/package-management.md#developer-workflow).
+After a dependency change, reactivate the checkout and restart Hermes.
+
 Hermes Agent integrates with Feishu and Lark as a full-featured bot. Once connected, you can chat with the agent in direct messages or group chats, receive cron job results in a home chat, and send text, images, audio, and file attachments through the normal gateway flow.
 
 The integration supports both connection modes:
@@ -31,12 +35,25 @@ Set it to `false` only if you explicitly want one shared conversation per chat.
 
 ## Step 1: Create a Feishu / Lark App
 
+### Recommended: Scan-to-Create (one command)
+
+```bash
+hermes gateway setup
+```
+
+Select **Feishu / Lark** and scan the QR code with your Feishu or Lark mobile app. Hermes will automatically create a bot application with the correct permissions and save the credentials.
+
+### Alternative: Manual Setup
+
+If scan-to-create is not available, the wizard falls back to manual input:
+
 1. Open the Feishu or Lark developer console:
    - Feishu: [https://open.feishu.cn/](https://open.feishu.cn/)
    - Lark: [https://open.larksuite.com/](https://open.larksuite.com/)
 2. Create a new app.
 3. In **Credentials & Basic Info**, copy the **App ID** and **App Secret**.
 4. Enable the **Bot** capability for the app.
+5. Run `hermes gateway setup`, select **Feishu / Lark**, and enter the credentials when prompted.
 
 :::warning
 Keep the App Secret private. Anyone with it can impersonate your app.
@@ -69,8 +86,9 @@ In the Feishu developer console, go to **Permission Management** and add the fol
 In **Events and Callbacks**:
 
 1. Set the connection mode to **Long Connection (WebSocket)** (recommended) or configure a webhook URL
-2. In the **Event Configuration** section, subscribe to:
+2. In the **Event Configuration** tab, subscribe to:
    - `im.message.receive_v1` — required for receiving messages
+3. In the **Callback Configuration** tab (a separate tab from events), set the same connection mode and add the `card.action.trigger` callback — required for the approval / update-prompt buttons. See [Required Feishu App Configuration](#required-feishu-app-configuration).
 
 ### Publish the App
 
@@ -88,7 +106,7 @@ FEISHU_CONNECTION_MODE=websocket
 
 **Requirements:** The `websockets` Python package must be installed. The SDK handles connection lifecycle, heartbeats, and auto-reconnection internally.
 
-**How it works:** The adapter runs the Lark SDK's WebSocket client in a background executor thread. Inbound events (messages, reactions, card actions) are dispatched to the main asyncio loop. On disconnect, the SDK will attempt to reconnect automatically.
+**How it works:** The adapter runs the Lark SDK's WebSocket client in a background executor thread. Inbound events (messages, reactions, card actions) are dispatched to the main asyncio loop. On disconnect, the SDK will attempt to reconnect automatically. If the link dies outright (the SDK's retry ladder gives up or the client thread exits), Hermes' supervisor rebuilds the client with capped backoff. While a link is down, `hermes gateway status` shows the platform as `retrying` until the connection is re-established.
 
 ### Optional: Webhook mode
 
@@ -222,19 +240,47 @@ FEISHU_GROUP_POLICY=allowlist   # default
 | `allowlist` | Hermes only responds to @mentions from users listed in `FEISHU_ALLOWED_USERS`. |
 | `disabled` | Hermes ignores all group messages entirely. |
 
-In all modes, the bot must be explicitly @mentioned (or @all) in the group before the message is processed. Direct messages bypass this gate.
+In all modes, the bot must be explicitly @mentioned (or @all) in the group before the message is processed. Direct messages always bypass this gate.
 
-### Bot Identity for @Mention Gating
+With the default `allowlist` policy and an empty `FEISHU_ALLOWED_USERS`, every human group message is rejected while DMs keep working. The first such drop is logged once at `WARNING` with the keys to set; later drops are `DEBUG`. Under a [multiplexed gateway](../multi-profile-gateways.md), each profile reads only its **own** `.env` — a `FEISHU_GROUP_POLICY=open` in the default profile's `.env` does not apply to a secondary profile's bot. Put `FEISHU_GROUP_POLICY` / `FEISHU_ALLOWED_USERS` in `profiles/<name>/.env`, or use `group_rules` in that profile's `config.yaml`.
 
-For precise @mention detection in groups, the adapter needs to know the bot's identity. It can be provided explicitly:
+Set `FEISHU_REQUIRE_MENTION=false` to let Hermes read all group traffic without requiring an @mention:
 
 ```bash
-FEISHU_BOT_OPEN_ID=ou_xxx
-FEISHU_BOT_USER_ID=xxx
-FEISHU_BOT_NAME=MyBot
+FEISHU_REQUIRE_MENTION=false
 ```
 
-If none of these are set, the adapter will attempt to auto-discover the bot name via the Application Info API on startup. For this to work, grant the `admin:app.info:readonly` or `application:application:self_manage` permission scope.
+For per-chat control, set `require_mention` on a `group_rules` entry — see [Per-Group Access Control](#per-group-access-control) below.
+
+### Bot Identity
+
+Hermes auto-detects the bot's `open_id` and display name on startup. You only need to set these manually when auto-detection cannot reach the Feishu API, or when your app uses tenant-scoped user IDs:
+
+```bash
+FEISHU_BOT_OPEN_ID=ou_xxx     # only when auto-detection fails
+FEISHU_BOT_USER_ID=xxx        # required if your app uses sender_id_type=user_id
+FEISHU_BOT_NAME=MyBot         # only when auto-detection fails
+```
+
+## Bot-to-Bot Messaging
+
+By default Hermes ignores messages sent by other bots. Enable bot-to-bot messaging when you want Hermes to participate in A2A orchestration or receive notifications from other bots in the same group.
+
+```bash
+FEISHU_ALLOW_BOTS=mentions   # default: none
+```
+
+| Value | Behavior |
+|-------|----------|
+| `none` | Ignore all messages from other bots (default). |
+| `mentions` | Accept only when the peer bot @mentions Hermes. |
+| `all` | Accept every peer bot message. |
+
+Also configurable as `feishu.allow_bots` in `config.yaml` (env wins when both are set).
+
+Peer bots do not need to be added to `FEISHU_ALLOWED_USERS` — that allowlist applies to human senders only.
+
+Grant the `application:bot.basic_info:read` scope to display peer bot names; without it, peer bots still route correctly but appear as their `open_id`.
 
 ## Interactive Card Actions
 
@@ -244,9 +290,81 @@ When users click buttons or interact with interactive cards sent by the bot, the
 - The action's `value` payload from the card definition is included as JSON.
 - Card actions are deduplicated with a 15-minute window to prevent double processing.
 
+Gateway-driven update prompts use a native Feishu `Yes` / `No` card instead of falling back to plain text replies. When `hermes update --gateway` needs confirmation, the adapter records the selected answer in Hermes's `.update_response` file and replaces the card inline with a resolved state.
+
 Card action events are dispatched with `MessageType.COMMAND`, so they flow through the normal command processing pipeline.
 
-To use this feature, enable the **Interactive Card** event in your Feishu app's event subscriptions (`card.action.trigger`).
+This is also how **command approval** works — when the agent needs to run a dangerous command, it sends an interactive card with Allow Once / Session / Always / Deny buttons. The user clicks a button, and the card action callback delivers the approval decision back to the agent.
+
+### Required Feishu App Configuration
+
+Interactive cards need the following configuration in the Feishu Developer Console. The usual symptom of a gap here is error **200340** when users click card buttons.
+
+1. **Subscribe to the card action callback (not an event):**
+   In **Development Configuration > Events and Callbacks**, open the **Callback Configuration** tab — it is separate from the **Event Configuration** tab where `im.message.receive_v1` lives — and add `card.action.trigger` under *Subscribed Callbacks*. Adding it as an event does not deliver button clicks.
+
+2. **Set the callback delivery mode:**
+   On the same tab choose **Long Connection** when Hermes runs in `websocket` mode (the Lark SDK receives the callback on the existing connection), or enter the request URL in webhook mode (the same endpoint as your event webhook, e.g. `https://your-server:8765/feishu/webhook`). Feishu must be able to reach and resolve that URL; otherwise clicks fail with 200342/200343.
+
+3. **Enable the Interactive Card capability:**
+   In **App Features > Bot**, ensure the **Interactive Card** toggle is enabled.
+
+4. **Publish a new app version:**
+   Callback changes only take effect after **Version Management > Create version** is published (and approved, for enterprise apps). Feishu's own description of 200340 is "the application has not configured the card callback address or the configured address is invalid … ensure that you have created and published the latest version of the app".
+
+:::warning
+Without a published card callback, Feishu will still successfully *send* interactive cards (sending only requires `im:message:send` permission), but clicking any button returns error 200340. The card appears to work — the error only surfaces when a user interacts with it, and the click never reaches Hermes (nothing is logged), because Feishu rejects it before delivering the callback.
+:::
+
+Error codes 200672 / 200673 indicate the callback *did* reach Hermes and Feishu rejected the response; if you see them, please file an issue with the matching `gateway.log` lines.
+
+## Document Comment Intelligent Reply
+
+Beyond chat, the adapter can also answer `@`-mentions left on **Feishu/Lark documents**. When a user comments on a document (local text selection or whole-doc comment) and @-mentions the bot, Hermes reads the document plus the surrounding comment thread and posts an LLM reply inline on the thread.
+
+Powered by the `drive.notice.comment_add_v1` event, the handler:
+
+- Fetches the document content and comment timeline in parallel (20 messages for whole-doc threads, 12 for local-selection threads).
+- Runs the agent with the `feishu_doc` + `feishu_drive` toolsets scoped to that single comment session.
+- Chunks replies at 4000 chars and posts them back as threaded replies.
+- Caches per-document sessions for 1 hour with a 50-message cap so follow-up comments on the same doc keep context.
+
+### 3-Tier Access Control
+
+Document-comment replies are **explicit-grant only** — there is no implicit allow-all mode. Permissions resolve in this order (first match wins, per field):
+
+1. **Exact doc** — rule scoped to a specific document token.
+2. **Wildcard** — rule that matches a pattern of docs.
+3. **Top-level** — default rule for the workspace.
+
+Two policies are available per rule:
+
+- **`allowlist`** — a static list of users / tenants.
+- **`pairing`** — static list ∪ runtime-approved store. Useful for rollouts where moderators can grant access live.
+
+Rules live in `~/.hermes/feishu_comment_rules.json` (pairing grants in `~/.hermes/feishu_comment_pairing.json`) with mtime-cached hot-reload — edits take effect on the next comment event without restarting the gateway.
+
+CLI:
+
+```bash
+# Inspect current rules and pairing state
+python -m gateway.platforms.feishu_comment_rules status
+
+# Simulate an access check for a specific doc + user
+python -m gateway.platforms.feishu_comment_rules check <fileType:fileToken> <user_open_id>
+
+# Manage pairing grants at runtime
+python -m gateway.platforms.feishu_comment_rules pairing list
+python -m gateway.platforms.feishu_comment_rules pairing add <user_open_id>
+python -m gateway.platforms.feishu_comment_rules pairing remove <user_open_id>
+```
+
+### Required Feishu App Configuration
+
+On top of the chat/card permissions already granted, add the drive comment event:
+
+- Subscribe to `drive.notice.comment_add_v1` in **Event Subscriptions**.
+- Grant the `docs:doc:readonly` and `drive:drive:readonly` scopes so the handler can read document content.
 
 ## Meeting Invitation Events
 
@@ -284,9 +402,9 @@ The adapter receives and caches the following media types from users:
 | **Video** | .mp4, .mov, .avi, .mkv, .webm, .m4v, .3gp | Downloaded and cached as documents |
 | **Files** | .pdf, .doc, .docx, .xls, .xlsx, .ppt, .pptx, and more | Downloaded and cached as documents |
 
-Media from rich-text (post) messages, including inline images and file attachments, is also extracted and cached.
+Media from rich-text (post) messages is also extracted and cached — both inline images/files inside the post body and attachments the composer sends in the top-level `files` list (a caption plus a file in one bubble). Every attachment is collected; folder entries are skipped, and each one leaves an `[Attachment: <name>]` marker in the text.
 
-For small text-based documents (.txt, .md), the file content is automatically injected into the message text so the agent can read it directly without needing tools.
+For small text-based documents (.txt, .md), the file content is automatically appended after the message text so the agent can read it directly without needing tools — the caption you typed alongside the file stays in place.
 
 ### Outbound (sending)
 
@@ -314,32 +432,11 @@ If the Feishu API rejects the post payload (e.g., due to unsupported markdown co
 
 Plain text messages (no markdown detected) are sent as the simple `text` message type.
 
-## Streaming Cards (Typewriter Effect)
+## Processing Status Reactions
 
-When streaming is enabled in `config.yaml`, the Feishu adapter uses **CardKit streaming cards** to deliver a native typewriter effect. Instead of repeatedly editing a message, the adapter:
+While the agent is working, the bot shows a `Typing` reaction on your message. It's cleared when the reply arrives, or replaced with `CrossMark` if processing failed.
 
-```yaml
-streaming:
-  enabled: true
-```
-
-1. Creates a streaming card via the CardKit API with `streaming_mode: true`
-2. Appends content progressively via the CardKit element content API
-3. Finalizes the card by disabling streaming mode when the response completes
-
-This provides a smooth, real-time typing animation with a native loading indicator — no cursor character (`▉`) is needed. The chat list preview shows `[生成中...]` while the response is being generated.
-
-:::tip
-Streaming is strongly recommended for Feishu. Other platforms (Telegram, Discord, etc.) use progressive message edits with a cursor character, but Feishu's CardKit provides a much smoother native experience.
-:::
-
-## ACK Emoji Reactions
-
-When the adapter receives an inbound message, it immediately adds an ✅ (OK) emoji reaction to signal that the message was received and is being processed. This provides visual feedback before the agent completes its response.
-
-The reaction is persistent — it remains on the message after the response is sent, serving as a receipt marker.
-
-User reactions on bot messages are also tracked. If a user adds or removes an emoji reaction on a message sent by the bot, it is routed as a synthetic text event (`reaction:added:EMOJI_TYPE` or `reaction:removed:EMOJI_TYPE`) so the agent can respond to feedback.
+Set `FEISHU_REACTIONS=false` to turn it off.
 
 ## Burst Protection and Batching
 
@@ -426,6 +523,9 @@ platforms:
           policy: "blacklist"
           blacklist:
             - "ou_blocked_user"
+        "oc_free_chat":
+          policy: "open"
+          require_mention: false       # overrides FEISHU_REQUIRE_MENTION for this chat
 ```
 
 | Policy | Description |
@@ -435,6 +535,8 @@ platforms:
 | `blacklist` | Everyone except users in the group's `blacklist` can use the bot |
 | `admin_only` | Only users in the global `admins` list can use the bot in this group |
 | `disabled` | Bot ignores all messages in this group |
+
+Set `require_mention: false` on a `group_rules` entry to skip the @-mention requirement for that specific chat. When omitted, the chat inherits the global `FEISHU_REQUIRE_MENTION` value.
 
 Groups not listed in `group_rules` fall back to `default_group_policy` (defaults to the value of `FEISHU_GROUP_POLICY`).
 
@@ -455,6 +557,8 @@ Inbound messages are deduplicated using message IDs with a 24-hour TTL. The dedu
 | `FEISHU_DOMAIN` | — | `feishu` | `feishu` (China) or `lark` (international) |
 | `FEISHU_CONNECTION_MODE` | — | `websocket` | `websocket` or `webhook` |
 | `FEISHU_ALLOWED_USERS` | — | _(empty)_ | Comma-separated open_id list for user allowlist |
+| `FEISHU_ALLOW_BOTS` | — | `none` | Accept messages from other bots: `none`, `mentions`, or `all` |
+| `FEISHU_REQUIRE_MENTION` | — | `true` | Whether group messages must @mention the bot |
 | `FEISHU_HOME_CHANNEL` | — | — | Chat ID for cron/notification output |
 | `FEISHU_ENCRYPT_KEY` | — | _(empty)_ | Encrypt key for webhook signature verification |
 | `FEISHU_VERIFICATION_TOKEN` | — | _(empty)_ | Verification token for webhook payload auth |
@@ -477,18 +581,21 @@ WebSocket and per-group ACL settings are configured via `config.yaml` under `pla
 
 | Problem | Fix |
 |---------|-----|
-| `lark-oapi not installed` | Install the SDK: `pip install lark-oapi` |
-| `websockets not installed; websocket mode unavailable` | Install websockets: `pip install websockets` |
-| `aiohttp not installed; webhook mode unavailable` | Install aiohttp: `pip install aiohttp` |
+| `lark-oapi not installed` | Install the SDK: `python -c "import pm; pm.sync_venv(['feishu'], explicit=True)"` |
+| `websockets not installed; websocket mode unavailable` | Install websockets: `hermes pm repair` |
+| `aiohttp not installed; webhook mode unavailable` | Install aiohttp: `python -c "import pm; pm.sync_venv(['messaging'], explicit=True)"` |
 | `FEISHU_APP_ID or FEISHU_APP_SECRET not set` | Set both env vars or configure via `hermes gateway setup` |
 | `Another local Hermes gateway is already using this Feishu app_id` | Only one Hermes instance can use the same app_id at a time. Stop the other gateway first. |
 | Bot doesn't respond in groups | Ensure the bot is @mentioned, check `FEISHU_GROUP_POLICY`, and verify the sender is in `FEISHU_ALLOWED_USERS` if policy is `allowlist` |
 | `Webhook rejected: invalid verification token` | Ensure `FEISHU_VERIFICATION_TOKEN` matches the token in your Feishu app's Event Subscriptions config |
 | `Webhook rejected: invalid signature` | Ensure `FEISHU_ENCRYPT_KEY` matches the encrypt key in your Feishu app config |
 | Post messages show as plain text | The Feishu API rejected the post payload; this is normal fallback behavior. Check logs for details. |
-| Streaming cards not working | Ensure `streaming.enabled: true` in `config.yaml` and that `lark_oapi` is installed with CardKit support. |
 | Images/files not received by bot | Grant `im:message` and `im:resource` permission scopes to your Feishu app |
-| Bot identity not auto-detected | Grant `admin:app.info:readonly` scope, or set `FEISHU_BOT_OPEN_ID` / `FEISHU_BOT_NAME` manually |
+| Bot identity not auto-detected | Usually a transient network issue reaching Feishu's bot info endpoint. Set `FEISHU_BOT_OPEN_ID` and `FEISHU_BOT_NAME` manually as a workaround. |
+| Peer bot messages still ignored after enabling `FEISHU_ALLOW_BOTS` | Hermes can't identify itself yet — set `FEISHU_BOT_OPEN_ID` (and `FEISHU_BOT_USER_ID` if your app uses `sender_id_type=user_id`). |
+| Peer bots show as `ou_xxxxxx` instead of by name | Grant the `application:bot.basic_info:read` scope. |
+| Error 200340 (also seen as 220340) when clicking approval buttons | Feishu has no valid card callback for the published app version: add `card.action.trigger` under the **Callback Configuration** tab (not Event Configuration), pick Long Connection / the request URL, enable **Interactive Card**, then publish a new version. See [Required Feishu App Configuration](#required-feishu-app-configuration). The click never reaches Hermes, so nothing appears in `gateway.log`. |
+| Error 200342 / 200343 when clicking approval buttons | Webhook mode: Feishu cannot connect to / resolve the callback request URL. Fix the URL or switch to Long Connection. |
 | `Webhook rate limit exceeded` | More than 120 requests/minute from the same IP. This is usually a misconfiguration or loop. |
 
 ## Toolset
