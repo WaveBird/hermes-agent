@@ -27,14 +27,14 @@ class TestBuildStreamingCardJson(unittest.TestCase):
     """Test the static card JSON builder."""
 
     def test_card_json_has_streaming_mode_enabled(self):
-        from gateway.platforms.feishu import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter
 
         card = FeishuAdapter._build_streaming_card_json("")
         assert card["schema"] == "2.0"
         assert card["config"]["streaming_mode"] is True
 
     def test_card_json_has_streaming_config(self):
-        from gateway.platforms.feishu import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter
 
         card = FeishuAdapter._build_streaming_card_json("")
         sc = card["config"]["streaming_config"]
@@ -43,7 +43,7 @@ class TestBuildStreamingCardJson(unittest.TestCase):
         assert sc["print_strategy"] in ("fast", "delay")
 
     def test_card_json_has_markdown_element_with_id(self):
-        from gateway.platforms.feishu import FeishuAdapter, _STREAMING_CARD_ELEMENT_ID
+        from plugins.platforms.feishu.adapter import FeishuAdapter, _STREAMING_CARD_ELEMENT_ID
 
         card = FeishuAdapter._build_streaming_card_json("hello")
         elements = card["body"]["elements"]
@@ -53,7 +53,7 @@ class TestBuildStreamingCardJson(unittest.TestCase):
         assert elements[0]["element_id"] == _STREAMING_CARD_ELEMENT_ID
 
     def test_card_json_default_empty_content(self):
-        from gateway.platforms.feishu import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter
 
         card = FeishuAdapter._build_streaming_card_json()
         assert card["body"]["elements"][0]["content"] == ""
@@ -65,7 +65,7 @@ class TestSendStreamingCard(unittest.TestCase):
 
     def _make_adapter(self):
         from gateway.config import PlatformConfig
-        from gateway.platforms.feishu import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
         return adapter
@@ -126,7 +126,7 @@ class TestSendStreamingCard(unittest.TestCase):
         async def _direct(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
             result = asyncio.run(
                 adapter.send_streaming_card(
                     chat_id="oc_chat",
@@ -179,7 +179,7 @@ class TestSendStreamingCard(unittest.TestCase):
         async def _direct(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
             result = asyncio.run(
                 adapter.send_streaming_card(chat_id="oc_chat", content="test")
             )
@@ -193,7 +193,7 @@ class TestSendStreamingCard(unittest.TestCase):
         async def _direct(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
             # First create the streaming card
             asyncio.run(adapter.send_streaming_card(chat_id="oc_chat"))
             # Now edit — should go through CardKit streaming API
@@ -220,7 +220,7 @@ class TestSendStreamingCard(unittest.TestCase):
         async def _direct(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
             result = asyncio.run(
                 adapter.edit_message(
                     chat_id="oc_chat",
@@ -240,7 +240,7 @@ class TestSendStreamingCard(unittest.TestCase):
         async def _direct(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
             # Create streaming card first
             asyncio.run(adapter.send_streaming_card(chat_id="oc_chat"))
             assert "om_456" in adapter._streaming_cards
@@ -264,7 +264,7 @@ class TestSendStreamingCard(unittest.TestCase):
         assert ok is True
 
     def test_streaming_cards_enabled_property(self):
-        from gateway.platforms.feishu import FEISHU_CARDKIT_AVAILABLE
+        from plugins.platforms.feishu.adapter import FEISHU_CARDKIT_AVAILABLE
 
         adapter = self._make_adapter()
         adapter._client = None
@@ -281,7 +281,7 @@ class TestSendStreamingCard(unittest.TestCase):
         async def _direct(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
             asyncio.run(adapter.send_streaming_card(chat_id="oc_chat"))
             # Do multiple updates
             asyncio.run(adapter.edit_message("oc_chat", "om_456", "text 1"))
@@ -295,131 +295,89 @@ class TestSendStreamingCard(unittest.TestCase):
 
 
 @patch.dict(os.environ, {}, clear=True)
-class TestStreamConsumerFeishuIntegration:
-    """Test GatewayStreamConsumer with Feishu streaming cards."""
+@patch.dict(os.environ, {}, clear=True)
+class TestAdapterStreamingIntegration(unittest.TestCase):
+    """The gateway consumer only sets ``expect_edits``; the adapter owns CardKit."""
 
-    @pytest.mark.asyncio
-    async def test_consumer_uses_streaming_card_when_enabled(self):
-        from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        adapter = AsyncMock()
-        adapter.streaming_cards_enabled = True
-        adapter.MAX_MESSAGE_LENGTH = 4096
-        adapter.send_streaming_card.return_value = SimpleNamespace(
-            success=True, message_id="om_stream"
-        )
-        adapter.edit_message.return_value = SimpleNamespace(
-            success=True, message_id="om_stream"
-        )
-        adapter.stop_streaming_card.return_value = True
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace()  # "connected" for streaming_cards_enabled
+        return adapter
 
-        consumer = GatewayStreamConsumer(
-            adapter=adapter,
-            chat_id="oc_test",
-            config=StreamConsumerConfig(edit_interval=0.01),
+    def _reply(self, message_id="om_card"):
+        return SimpleNamespace(
+            code=0,
+            msg="success",
+            data=SimpleNamespace(message_id=message_id),
+            success=lambda: True,
         )
 
-        assert consumer._uses_streaming_card is True
+    def test_send_with_expect_edits_uses_streaming_card(self):
+        from gateway.platforms.base import SendResult
 
-        consumer.on_delta("Hello ")
-        consumer.on_delta("World!")
-        consumer.finish()
-        await consumer.run()
+        adapter = self._make_adapter()
+        with patch("plugins.platforms.feishu.adapter.FEISHU_CARDKIT_AVAILABLE", True), \
+             patch.object(
+                 adapter, "send_streaming_card",
+                 AsyncMock(return_value=SendResult(success=True, message_id="om_card")),
+             ) as card_send, \
+             patch.object(adapter, "_feishu_send_with_retry", AsyncMock()) as plain_send:
+            result = asyncio.run(
+                adapter.send("oc_chat", "partial *text*", metadata={"expect_edits": True})
+            )
 
-        # Should have used send_streaming_card, not send
-        adapter.send_streaming_card.assert_called()
-        adapter.send.assert_not_called()
-        # Should have called stop_streaming_card at the end
-        adapter.stop_streaming_card.assert_called_once_with("om_stream")
+        assert result.success and result.message_id == "om_card"
+        card_send.assert_awaited_once()
+        plain_send.assert_not_awaited()
 
-    @pytest.mark.asyncio
-    async def test_consumer_does_not_add_cursor_for_streaming_cards(self):
-        from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+    def test_send_without_expect_edits_uses_regular_message(self):
+        adapter = self._make_adapter()
+        with patch("plugins.platforms.feishu.adapter.FEISHU_CARDKIT_AVAILABLE", True), \
+             patch.object(adapter, "send_streaming_card", AsyncMock()) as card_send, \
+             patch.object(
+                 adapter, "_feishu_send_with_retry", AsyncMock(return_value=self._reply("om_text")),
+             ) as plain_send:
+            result = asyncio.run(adapter.send("oc_chat", "a final message"))
 
-        adapter = AsyncMock()
-        adapter.streaming_cards_enabled = True
-        adapter.MAX_MESSAGE_LENGTH = 4096
-        adapter.send_streaming_card.return_value = SimpleNamespace(
-            success=True, message_id="om_stream"
+        assert result.success and result.message_id == "om_text"
+        card_send.assert_not_awaited()
+        plain_send.assert_awaited()
+
+    def test_send_falls_back_to_text_when_card_creation_fails(self):
+        from gateway.platforms.base import SendResult
+
+        adapter = self._make_adapter()
+        with patch("plugins.platforms.feishu.adapter.FEISHU_CARDKIT_AVAILABLE", True), \
+             patch.object(
+                 adapter, "send_streaming_card",
+                 AsyncMock(return_value=SendResult(success=False, error="cardkit down")),
+             ), \
+             patch.object(
+                 adapter, "_feishu_send_with_retry", AsyncMock(return_value=self._reply("om_text")),
+             ) as plain_send:
+            result = asyncio.run(adapter.send("oc_chat", "partial", metadata={"expect_edits": True}))
+
+        assert result.success and result.message_id == "om_text"
+        plain_send.assert_awaited()
+
+    def test_edit_of_tracked_card_routes_to_cardkit_and_finalize_stops_it(self):
+        from gateway.platforms.base import SendResult
+        from plugins.platforms.feishu.adapter import _FeishuStreamingCard
+
+        adapter = self._make_adapter()
+        adapter._streaming_cards["om_card"] = _FeishuStreamingCard(
+            card_id="card_1", element_id="streaming_md_1", message_id="om_card",
         )
-        adapter.edit_message.return_value = SimpleNamespace(
-            success=True, message_id="om_stream"
-        )
-        adapter.stop_streaming_card.return_value = True
+        with patch.object(
+            adapter, "_update_streaming_card_content",
+            AsyncMock(return_value=SendResult(success=True, message_id="om_card")),
+        ) as update, patch.object(
+            adapter, "stop_streaming_card", AsyncMock(return_value=True),
+        ) as stop:
+            asyncio.run(adapter.edit_message("oc_chat", "om_card", "done", finalize=True))
 
-        consumer = GatewayStreamConsumer(
-            adapter=adapter,
-            chat_id="oc_test",
-            config=StreamConsumerConfig(edit_interval=0.01, cursor=" ▌"),
-        )
-
-        consumer.on_delta("Hello")
-        await asyncio.sleep(0.05)
-        consumer.finish()
-        await consumer.run()
-
-        # Verify cursor was NOT added to any call
-        for call in adapter.edit_message.call_args_list:
-            content = call.kwargs.get("content", call.args[2] if len(call.args) > 2 else "")
-            assert "▌" not in content
-
-    @pytest.mark.asyncio
-    async def test_consumer_falls_back_when_streaming_not_enabled(self):
-        from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-
-        adapter = AsyncMock()
-        adapter.streaming_cards_enabled = False
-        adapter.MAX_MESSAGE_LENGTH = 4096
-        adapter.send.return_value = SimpleNamespace(
-            success=True, message_id="om_regular"
-        )
-        adapter.edit_message.return_value = SimpleNamespace(
-            success=True, message_id="om_regular"
-        )
-
-        consumer = GatewayStreamConsumer(
-            adapter=adapter,
-            chat_id="oc_test",
-            config=StreamConsumerConfig(edit_interval=0.01),
-        )
-
-        assert consumer._uses_streaming_card is False
-
-        consumer.on_delta("Hello")
-        consumer.finish()
-        await consumer.run()
-
-        # Should use regular send, not streaming card
-        adapter.send.assert_called()
-        adapter.send_streaming_card.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_consumer_stops_streaming_card_on_segment_break(self):
-        from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-
-        adapter = AsyncMock()
-        adapter.streaming_cards_enabled = True
-        adapter.MAX_MESSAGE_LENGTH = 4096
-        adapter.send_streaming_card.return_value = SimpleNamespace(
-            success=True, message_id="om_stream"
-        )
-        adapter.edit_message.return_value = SimpleNamespace(
-            success=True, message_id="om_stream"
-        )
-        adapter.stop_streaming_card.return_value = True
-
-        consumer = GatewayStreamConsumer(
-            adapter=adapter,
-            chat_id="oc_test",
-            config=StreamConsumerConfig(edit_interval=0.01),
-        )
-
-        consumer.on_delta("First segment")
-        await asyncio.sleep(0.05)
-        consumer.on_delta(None)  # Tool boundary / segment break
-        await asyncio.sleep(0.05)
-        consumer.finish()
-        await consumer.run()
-
-        # Should have called stop at least once for the segment break
-        assert adapter.stop_streaming_card.call_count >= 1
+        update.assert_awaited_once()
+        stop.assert_awaited_once_with("om_card")
