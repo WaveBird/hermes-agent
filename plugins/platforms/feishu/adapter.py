@@ -174,6 +174,12 @@ _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
 _FEISHU_SEND_ATTEMPTS = 3
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
+# Feishu 234037 = the requested file exceeds the single-request download limit
+# (~25 MB). The API still honours ``Range: bytes=start-end`` for those files, so
+# the adapter falls back to a chunked download instead of failing outright.
+_FEISHU_FILE_SIZE_EXCEEDED_CODE = 234037
+# Chunk size for Range-based downloads — 10 MB per request.
+_FEISHU_CHUNK_DOWNLOAD_SIZE = 10 * 1024 * 1024
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
 _DEFAULT_TEXT_BATCH_MAX_CHARS = 4000
@@ -3394,10 +3400,23 @@ class FeishuAdapter(BasePlatformAdapter):
                     message_id=message_id, file_key=file_key, resource_type=request_type,
                 )
                 if not response or not response.success():
+                    code = getattr(response, "code", None)
+                    if code == _FEISHU_FILE_SIZE_EXCEEDED_CODE:
+                        logger.info(
+                            "[Feishu] File %s exceeds single-request download limit (code %s), "
+                            "falling back to chunked Range download",
+                            file_key, code,
+                        )
+                        chunked = await self._download_feishu_resource_chunked(
+                            message_id=message_id, file_key=file_key,
+                            resource_type=request_type, fallback_filename=fallback_filename,
+                        )
+                        if chunked[0]:
+                            return chunked
                     logger.debug(
                         "[Feishu] Resource download failed for %s/%s via type=%s: %s %s",
                         message_id, file_key, request_type,
-                        getattr(response, "code", "unknown"), getattr(response, "msg", "request failed"),
+                        code, getattr(response, "msg", "request failed"),
                     )
                     continue
                 raw_bytes = self._read_binary_response(response)
@@ -3433,7 +3452,6 @@ class FeishuAdapter(BasePlatformAdapter):
         return "", ""
 
     # --- Static helpers — extension / media-type guessing ---
-    @staticmethod
     async def _download_feishu_resource_chunked(
         self, *, message_id: str, file_key: str, resource_type: str, fallback_filename: str,
     ) -> tuple[str, str]:
@@ -3509,6 +3527,7 @@ class FeishuAdapter(BasePlatformAdapter):
         return cached_path, (media_type or self._guess_document_media_type(filename))
 
 
+    @staticmethod
     def _read_binary_response(response: Any) -> bytes:
         file_obj = getattr(response, "file", None)
         if file_obj is None:
