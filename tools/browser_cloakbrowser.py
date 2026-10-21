@@ -149,35 +149,28 @@ async def _async_get_session(task_id: Optional[str], headless: bool) -> Dict[str
 
     launch_async = _import_cloakbrowser_launch()
 
-    # Read proxy from Hermes env vars (set via .env or hermes_proxy_on/off).
-    # Pass it to Playwright as per-context proxy so Chromium uses Clash for
-    # external sites while BYD internal traffic is handled by Clash's bypass rules.
-    # Clear proxy env vars *before* launch_async so Chromium doesn't get a
-    # blanket env-level proxy (which would route ALL traffic including BYD
-    # internal sites through Clash, causing ERR_CONNECTION_RESET on misconfigured
-    # Clash rules).  Playwright's per-context proxy is the correct mechanism.
-    _proxy_vars = {}
+    # Hot-load proxy from system env vars (no hardcoding).
+    # Read HTTPS_PROXY / HTTP_PROXY / ALL_PROXY (and lowercase variants).
+    # Pass directly to launch_async(proxy=...) so CloakBrowser injects
+    # --proxy-server at the Chromium process level — the only mechanism that
+    # reliably routes all browser traffic through the proxy.  Per-context
+    # proxy via new_context(proxy=...) only works after the context is
+    # created; requests before that (and some subresource types) bypass it.
     _proxy_url = None
-    for _k in ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy', 'all_proxy']:
+    for _k in ('HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy'):
         _v = os.environ.get(_k)
         if _v:
-            _proxy_vars[_k] = _v
-            if _proxy_url is None:
-                _proxy_url = _v  # first valid proxy wins
-            del os.environ[_k]
+            _proxy_url = _v
+            break
 
-    browser = await launch_async(headless=headless)
-
-    # Restore proxy vars for the rest of the process
-    os.environ.update(_proxy_vars)
-
-    # Pass proxy to Playwright context level (not env level).
-    # This lets Clash's bypass rules handle BYD internal traffic correctly,
-    # while external sites go through the proxy.
-    _context_kwargs = {"no_viewport": True}
     if _proxy_url:
-        _context_kwargs["proxy"] = {"server": _proxy_url}
-    context = await browser.new_context(**_context_kwargs)
+        logger.info("CloakBrowser using proxy from env: %s", _proxy_url)
+        browser = await launch_async(headless=headless, proxy=_proxy_url)
+    else:
+        logger.info("CloakBrowser launching without proxy (none in env)")
+        browser = await launch_async(headless=headless)
+
+    context = await browser.new_context(no_viewport=True)
     page = await context.new_page()
 
     # Create session dict first (so handlers can reference it)
