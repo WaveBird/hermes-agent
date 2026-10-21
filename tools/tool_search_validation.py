@@ -136,6 +136,43 @@ def validate_deferred_call_args(name: str, args: dict[str, Any]) -> Optional[str
         return None
 
 
+_MAX_ARGUMENT_NESTING = 8
+
+
+def _recover_name_from_arguments(raw_args: Any) -> tuple[str, Any]:
+    """Lift a tool name folded inside ``arguments`` back to the entry level.
+
+    Some models put the tool name inside the arguments dict (e.g.
+    ``arguments={"name": "foo", "target": ...}``) or wrap the whole call in one
+    or more extra ``arguments`` layers. Unwrap until the real parameter object
+    is reached, capturing the first ``name`` seen along the way. That ``name`` is
+    not a parameter of the underlying tool, so it is stripped from the args
+    handed to schema validation. Returns ``(name, args)``; ``name`` is ``""``
+    when none was found.
+    """
+    bottom = raw_args
+    name = ""
+    seen = 0
+    while True:
+        if isinstance(bottom, str):
+            try:
+                bottom = json.loads(bottom)
+            except json.JSONDecodeError:
+                break
+        if not isinstance(bottom, dict):
+            break
+        nested = str(bottom.get("name") or "").strip()
+        if nested and not name:
+            name = nested
+        if "arguments" not in bottom or seen >= _MAX_ARGUMENT_NESTING:
+            break
+        bottom = bottom.get("arguments")
+        seen += 1
+    if name and isinstance(bottom, dict) and "name" in bottom:
+        bottom = {k: v for k, v in bottom.items() if k != "name"}
+    return name, bottom
+
+
 def normalize_tool_call_entries(args: dict[str, Any]) -> tuple[list[dict[str, Any]], Optional[str]]:
     """Normalize ``tool_call`` arguments into a ``calls[]`` list of entries.
 
@@ -148,9 +185,15 @@ def normalize_tool_call_entries(args: dict[str, Any]) -> tuple[list[dict[str, An
     raw_calls = args.get("calls")
     if raw_calls is None:
         # Legacy single shape.
-        if not str(args.get("name") or "").strip():
-            return [], "tool_call requires 'calls' (an array of {name, arguments})"
-        raw_calls = [{"name": args.get("name"), "arguments": args.get("arguments")}]
+        name = str(args.get("name") or "").strip()
+        recovered, raw_arguments = _recover_name_from_arguments(args.get("arguments"))
+        if not name:
+            name = recovered
+        if not name:
+            if raw_arguments is None:
+                return [], "tool_call requires 'calls' (an array of {name, arguments})"
+            return [], "tool_call requires a 'name' argument"
+        raw_calls = [{"name": name, "arguments": raw_arguments}]
     if isinstance(raw_calls, str):
         # Tolerate the model emitting the batch envelope as a JSON string —
         # mirror the per-entry `arguments` handling below (#114484).
@@ -168,11 +211,13 @@ def normalize_tool_call_entries(args: dict[str, Any]) -> tuple[list[dict[str, An
         if not isinstance(raw, dict):
             return [], f"tool_call calls[{position}] must be an object with 'name' and 'arguments'"
         name = str(raw.get("name") or "").strip()
+        recovered, raw_args = _recover_name_from_arguments(raw.get("arguments"))
+        if not name:
+            name = recovered
         if not name:
             return [], f"tool_call calls[{position}] requires a 'name'"
         if name in BRIDGE_TOOL_NAMES:
             return [], f"tool_call cannot invoke '{name}' (it is itself a bridge tool)"
-        raw_args = raw.get("arguments")
         if raw_args is None or (isinstance(raw_args, str) and not raw_args.strip()):
             # "" / whitespace is how some OpenAI-compatible gateways spell "no arguments" for a
             # parameterless tool (#83937); the loop already treats an empty outer arguments string
