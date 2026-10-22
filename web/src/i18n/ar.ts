@@ -147,6 +147,9 @@ export const ar = defineLocale({
     sessionDeleted: "تم حذف الجلسة",
     failedToDelete: "فشل حذف الجلسة",
     resumeInChat: "استئناف في المحادثة",
+    manageInSessions: "إدارة في الجلسات",
+    linkedSession: "جلسة من الدردشة",
+    linkedSessionMissing: "هذه الجلسة لم تعد موجودة",
     previousPage: "الصفحة السابقة",
     nextPage: "الصفحة التالية",
     roles: {

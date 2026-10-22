@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const apiMocks = vi.hoisted(() => ({
   getSessions: vi.fn(),
   getSessionMessages: vi.fn(),
+  getSessionDetail: vi.fn(),
   getEmptySessionsCount: vi.fn(),
   getStatus: vi.fn(),
   searchSessions: vi.fn(),
@@ -56,7 +57,10 @@ function click(el: Element | null) {
 
 const button = (label: string) => document.querySelector(`button[aria-label="${label}"]`);
 
-async function renderSessionsPage(rows: Record<string, unknown>[]) {
+async function renderSessionsPage(
+  rows: Record<string, unknown>[],
+  { path }: { path?: string } = {},
+) {
   // Page list uses limit 20; the overview tab's recent-cards fetch uses 50 —
   // keep the overview empty so the list view (with row actions) renders.
   apiMocks.getSessions.mockImplementation(async (limit: number) => ({
@@ -79,7 +83,7 @@ async function renderSessionsPage(rows: Record<string, unknown>[]) {
   await act(async () =>
     root.render(
       <I18nProvider>
-        <MemoryRouter>
+        <MemoryRouter initialEntries={path ? [path] : undefined}>
           <SystemActionsProvider>
             <ProfileProvider>
               <PageHeaderProvider pluginTabs={[]}>
@@ -257,5 +261,87 @@ describe("structured reasoning rendering (#59957)", () => {
     expect(text).toContain("<action>tool_call</action>");
     expect(text).toContain('<result>{"ok":true}</result>');
     expect(document.querySelectorAll("pre code").length).toBe(0);
+  });
+});
+
+describe("chat rail deep link (#49077)", () => {
+  const linkedRow = {
+    id: "sid-linked",
+    profile: "default",
+    source: "cron",
+    model: null,
+    title: "Linked from chat",
+    started_at: 1,
+    ended_at: null,
+    last_active: 1,
+    is_active: false,
+    message_count: 1,
+    tool_call_count: 0,
+    input_tokens: 1,
+    output_tokens: 1,
+    preview: "linked",
+  };
+
+  it("pins and expands a linked session that is not on the current page", async () => {
+    apiMocks.getSessionDetail.mockResolvedValue(linkedRow);
+    apiMocks.getSessionMessages.mockResolvedValue({
+      session_id: "sid-linked",
+      messages: [{ role: "user", content: "opened from the chat rail" }],
+    });
+
+    // Empty page list: the pin must stand in for it, not be swallowed by the
+    // "no sessions" empty state.
+    await renderSessionsPage([], { path: "/sessions?session=sid-linked" });
+
+    await waitFor(() => (document.body.textContent ?? "").includes("opened from the chat rail"));
+    expect(apiMocks.getSessionDetail).toHaveBeenCalledWith("sid-linked");
+
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("Session from Chat");
+    expect(text).toContain("Linked from chat");
+    expect(text).not.toContain("No sessions yet");
+  });
+
+  it("reports a stale link instead of rendering an empty list", async () => {
+    apiMocks.getSessionDetail.mockRejectedValue(new Error("not_found"));
+    await renderSessionsPage(
+      [
+        {
+          id: "sid-other",
+          profile: "default",
+          source: "cli",
+          model: null,
+          title: "Other",
+          started_at: 1,
+          ended_at: null,
+          last_active: 1,
+          is_active: false,
+          message_count: 1,
+          tool_call_count: 0,
+          input_tokens: 1,
+          output_tokens: 1,
+          preview: "other",
+        },
+      ],
+      { path: "/sessions?session=sid-gone" },
+    );
+
+    await waitFor(() =>
+      (document.body.textContent ?? "").includes("That session no longer exists"),
+    );
+    expect(document.body.textContent).not.toContain("Session from Chat");
+  });
+
+  it("resolves the linked row against the profile the rail was scoped to", async () => {
+    apiMocks.getSessionDetail.mockResolvedValue({ ...linkedRow, profile: "worker" });
+    apiMocks.getSessionMessages.mockResolvedValue({
+      session_id: "sid-linked",
+      messages: [{ role: "user", content: "scoped profile row" }],
+    });
+
+    await renderSessionsPage([], { path: "/sessions?session=sid-linked&profile=worker" });
+
+    await waitFor(() => (document.body.textContent ?? "").includes("scoped profile row"));
+    expect(apiMocks.getSessionDetail).toHaveBeenCalledWith("sid-linked", "worker");
   });
 });

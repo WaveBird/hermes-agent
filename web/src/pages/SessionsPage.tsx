@@ -6,7 +6,7 @@ import {
   useCallback,
   useRef,
 } from "react";
-import { useNavigate } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -15,6 +15,7 @@ import {
   ChevronRight,
   Database,
   ListFilter,
+  Link2,
   Search,
   Trash2,
   Clock,
@@ -738,12 +739,22 @@ function SessionsPagination({
 }
 
 export default function SessionsPage() {
+  const [searchParams] = useSearchParams();
+  // Deep link from the Chat tab's session rail (`/sessions?session=<id>`) —
+  // that rail is a switcher, so every management action lands here instead of
+  // being reimplemented beside the terminal. The resolved row is pinned and
+  // expanded below; `linkedHandledRef` keeps a re-render from re-applying it.
+  const linkedSessionId = searchParams.get("session");
+  // The rail can be scoped to a non-management profile; its hand-off carries
+  // that profile so the row resolves (and later deletes/renames) against the
+  // right state DB rather than the management default.
+  const linkedProfile = searchParams.get("profile") || undefined;
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [expandedId, setExpandedId] = useState<string | null>(linkedSessionId);
   const [searchResults, setSearchResults] = useState<
     SessionSearchResult[] | null
   >(null);
@@ -753,9 +764,9 @@ export default function SessionsPage() {
   const logScrollRef = useRef<HTMLPreElement | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [overviewSessions, setOverviewSessions] = useState<SessionInfo[]>([]);
-  const [view, setView] = useState<SessionsView>("overview");
+  const [view, setView] = useState<SessionsView>(linkedSessionId ? "list" : "overview");
   const [sessionCategory, setSessionCategory] =
-    useState<SessionFilterCategory>("chats");
+    useState<SessionFilterCategory>(linkedSessionId ? "all" : "chats");
   const [sourceSelectionsByCategory, setSourceSelectionsByCategory] =
     useState<SourceSelectionsByCategory>({
       chats: null,
@@ -776,6 +787,12 @@ export default function SessionsPage() {
   const [emptyCount, setEmptyCount] = useState(0);
   const [deleteEmptyOpen, setDeleteEmptyOpen] = useState(false);
   const [deletingEmpty, setDeletingEmpty] = useState(false);
+  // Row resolved from the `?session=` deep link. Kept out of `sessions` so the
+  // 5s overview poll and every page reload don't wipe it, and rendered above the
+  // page list when the id isn't on the current page.
+  const [linkedSession, setLinkedSession] = useState<SessionInfo | null>(null);
+  const linkedHandledRef = useRef<string | null>(null);
+  const linkedRowRef = useRef<HTMLDivElement | null>(null);
   // Bulk-select-then-delete state. ``selectedIds`` is a Set so per-row
   // checkbox toggles and ``has()`` lookups are O(1); we wrap mutations
   // in a fresh Set so React notices the change (mutating in place
@@ -916,6 +933,75 @@ export default function SessionsPage() {
     setSelectedIds(new Set());
     lastClickedIndexRef.current = null;
   }, []);
+
+  /** Toggle one row that is NOT part of the rendered page list (the pinned
+   *  deep-link row). Shift-range select has no meaning there, so its anchor is
+   *  cleared rather than left pointing into a list the row isn't in. */
+  const toggleLinkedSelection = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+    lastClickedIndexRef.current = null;
+  }, []);
+
+  // Resolve the Chat rail's deep link into a row. The linked session may be an
+  // automation session, may sit on a page the user isn't on, and the page opens
+  // on the overview tab by default — so drop the view/search/source filters that
+  // would hide it and fetch the row by id instead of paging until it shows up.
+  useEffect(() => {
+    if (!linkedSessionId || linkedHandledRef.current === linkedSessionId) return;
+    linkedHandledRef.current = linkedSessionId;
+    let cancelled = false;
+    // Deferred like the mount loader below: these writes describe the incoming
+    // navigation, not a render-time derivation, and keeping them out of the
+    // effect body avoids the set-state-in-effect lint trap.
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setView("list");
+      setSearch("");
+      setSessionCategory("all");
+      setSourceSelectionsByCategory((prev) => ({ ...prev, all: null }));
+      setPage(0);
+      clearSelection();
+      setExpandedId(linkedSessionId);
+    });
+    const detail = linkedProfile
+      ? api.getSessionDetail(linkedSessionId, linkedProfile)
+      : api.getSessionDetail(linkedSessionId);
+    detail
+      .then((row) => {
+        if (!cancelled) setLinkedSession(row);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // A stale link (deleted session) must say so instead of silently
+        // rendering an empty list that looks like a filter bug.
+        setLinkedSession(null);
+        showToast(t.sessions.linkedSessionMissing, "error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    clearSelection,
+    linkedProfile,
+    linkedSessionId,
+    showToast,
+    t.sessions.linkedSessionMissing,
+  ]);
+
+  // Bring the pinned row into view once the list has rendered. jsdom has no
+  // layout engine, hence the capability guard instead of a bare call.
+  useEffect(() => {
+    if (loading || !linkedSession) return;
+    const el = linkedRowRef.current;
+    if (el && typeof el.scrollIntoView === "function") {
+      el.scrollIntoView({ block: "center" });
+    }
+  }, [loading, linkedSession]);
 
   useLayoutEffect(() => {
     if (loading) {
@@ -1207,8 +1293,12 @@ export default function SessionsPage() {
   // Current search rows carry the same stamp; an unstamped row from an older
   // backend still falls back to the management profile.
   const rowProfile = useCallback(
-    (id: string) => (searchResults ?? sessions).find((s) => s.id === id)?.profile,
-    [searchResults, sessions],
+    (id: string) =>
+      (searchResults ?? sessions).find((s) => s.id === id)?.profile ??
+      // The pinned deep-link row lives outside both lists; it is stamped by
+      // the detail endpoint, so its own profile is authoritative for it.
+      (linkedSession?.id === id ? linkedSession.profile : undefined),
+    [linkedSession, searchResults, sessions],
   );
 
   const sessionDelete = useConfirmDelete({
@@ -1219,6 +1309,9 @@ export default function SessionsPage() {
           setSessions((prev) => prev.filter((s) => s.id !== id));
           setTotal((prev) => prev - 1);
           if (expandedId === id) setExpandedId(null);
+          // A pinned deep-link row can be deleted too — drop the pin so the
+          // list doesn't keep showing a session that no longer exists.
+          setLinkedSession((cur) => (cur?.id === id ? null : cur));
           // Drop the deleted ID from any active bulk-select set — it
           // can't bulk-delete a row that's already gone.
           setSelectedIds((prev) => {
@@ -1346,6 +1439,7 @@ export default function SessionsPage() {
       setSessions((prev) => prev.filter((s) => !deletedSet.has(s.id)));
       setTotal((prev) => Math.max(0, prev - resp.deleted));
       if (expandedId && deletedSet.has(expandedId)) setExpandedId(null);
+      setLinkedSession((cur) => (cur && deletedSet.has(cur.id) ? null : cur));
       clearSelection();
       loadSessions(page);
       refreshEmptyCount();
@@ -1411,6 +1505,7 @@ export default function SessionsPage() {
         setSessions((prev) =>
           prev.map((s) => (s.id === id ? { ...s, title } : s)),
         );
+        setLinkedSession((cur) => (cur && cur.id === id ? { ...cur, title } : cur));
         setOverviewSessions((prev) =>
           prev.map((s) => (s.id === id ? { ...s, title } : s)),
         );
@@ -1473,7 +1568,8 @@ export default function SessionsPage() {
   }, [pruneDays, showToast, loadSessions, loadStats]);
 
   const pendingSession = sessionDelete.pendingId
-    ? sessions.find((s) => s.id === sessionDelete.pendingId)
+    ? sessions.find((s) => s.id === sessionDelete.pendingId) ??
+      (linkedSession?.id === sessionDelete.pendingId ? linkedSession : null)
     : null;
 
   // Build snippet map from search results (session_id → snippet)
@@ -1486,6 +1582,11 @@ export default function SessionsPage() {
   }
 
   const filtered = searchResults ?? sessions;
+
+  // The pinned deep-link row stands in for a page-list entry: render it only
+  // when the current page + filters don't already contain the same session.
+  const linkedRowVisible =
+    linkedSession !== null && !filtered.some((s) => s.id === linkedSession.id);
 
   const platformEntries = status
     ? Object.entries(status.gateway_platforms ?? {})
@@ -2012,7 +2113,73 @@ export default function SessionsPage() {
       )}
 
       {showList ? (
-        filtered.length === 0 ? (
+        linkedRowVisible || filtered.length > 0 ? (
+          <>
+            {linkedRowVisible && linkedSession && (
+              // Pinned row for the `?session=` deep link: the Chat rail hands
+              // management off here, and the linked session may not be on the
+              // current page (or may be filtered out), so it renders above the
+              // page list with the full row action set (#49077).
+              <div
+                ref={linkedRowRef}
+                className="flex min-w-0 flex-col gap-1.5 border-b border-dashed border-border pb-3"
+              >
+                <span className="flex items-center gap-1.5 text-xs text-text-tertiary">
+                  <Link2 className="h-3 w-3" aria-hidden />
+                  {t.sessions.linkedSession}
+                </span>
+                <SessionRow
+                  session={linkedSession}
+                  isExpanded={expandedId === linkedSession.id}
+                  isSelected={selectedIds.has(linkedSession.id)}
+                  onToggle={() =>
+                    setExpandedId((prev) =>
+                      prev === linkedSession.id ? null : linkedSession.id,
+                    )
+                  }
+                  onSelectClick={() => toggleLinkedSelection(linkedSession.id)}
+                  onDelete={() => sessionDelete.requestDelete(linkedSession.id)}
+                  onRename={handleRename}
+                  onExport={handleExport}
+                  resumeInChatEnabled={resumeInChatEnabled}
+                />
+              </div>
+            )}
+
+            {filtered.length > 0 && (
+              <div className="flex min-w-0 flex-col gap-1.5">
+                {filtered.map((s, index) => (
+                  <SessionRow
+                    key={s.id}
+                    session={s}
+                    snippet={snippetMap.get(s.id)}
+                    searchQuery={search || undefined}
+                    isExpanded={expandedId === s.id}
+                    isSelected={selectedIds.has(s.id)}
+                    onToggle={() =>
+                      setExpandedId((prev) => (prev === s.id ? null : s.id))
+                    }
+                    onSelectClick={(event) =>
+                      handleSelectClick(event, index, filtered)
+                    }
+                    onDelete={() => sessionDelete.requestDelete(s.id)}
+                    onRename={handleRename}
+                    onExport={handleExport}
+                    resumeInChatEnabled={resumeInChatEnabled}
+                  />
+                ))}
+              </div>
+            )}
+
+            {showPagination && (
+              <SessionsPagination
+                page={page}
+                total={total}
+                onPageChange={goToPage}
+              />
+            )}
+          </>
+        ) : (
           <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
             <Clock className="h-8 w-8 mb-3 opacity-40" />
             <p className="text-sm font-medium">
@@ -2028,39 +2195,6 @@ export default function SessionsPage() {
               </p>
             )}
           </div>
-        ) : (
-          <>
-            <div className="flex min-w-0 flex-col gap-1.5">
-              {filtered.map((s, index) => (
-                <SessionRow
-                  key={s.id}
-                  session={s}
-                  snippet={snippetMap.get(s.id)}
-                  searchQuery={search || undefined}
-                  isExpanded={expandedId === s.id}
-                  isSelected={selectedIds.has(s.id)}
-                  onToggle={() =>
-                    setExpandedId((prev) => (prev === s.id ? null : s.id))
-                  }
-                  onSelectClick={(event) =>
-                    handleSelectClick(event, index, filtered)
-                  }
-                  onDelete={() => sessionDelete.requestDelete(s.id)}
-                  onRename={handleRename}
-                  onExport={handleExport}
-                  resumeInChatEnabled={resumeInChatEnabled}
-                />
-              ))}
-            </div>
-
-            {showPagination && (
-              <SessionsPagination
-                page={page}
-                total={total}
-                onPageChange={goToPage}
-              />
-            )}
-          </>
         )
       ) : (
         <div className="flex min-w-0 flex-col gap-4">

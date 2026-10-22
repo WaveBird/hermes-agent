@@ -15,15 +15,18 @@
  * This is a navigation surface, NOT a session-management one — delete,
  * rename, export, and bulk actions live on the Sessions page. Keeping this
  * panel read-only (plus select / new) avoids duplicating that machinery and
- * keeps the chat context focused on switching conversations quickly.
+ * keeps the chat context focused on switching conversations quickly. Each row
+ * therefore carries one management hand-off: "Manage in Sessions" navigates to
+ * `/sessions?session=<id>`, where the full row action set (rename, export,
+ * delete, bulk cleanup) already lives and the linked row is focused for you.
  */
 
 import { Button } from "@nous-research/ui/ui/components/button";
 import { ListItem } from "@nous-research/ui/ui/components/list-item";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
-import { AlertCircle, MessageSquarePlus, RefreshCw } from "lucide-react";
+import { AlertCircle, MessageSquarePlus, RefreshCw, SlidersHorizontal } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
 
 import { ChatWorkspacePicker } from "@/components/ChatWorkspacePicker";
 import { useI18n } from "@/i18n";
@@ -78,6 +81,7 @@ export function ChatSessionList({
   onWorkspaceChange,
 }: ChatSessionListProps) {
   const { t } = useI18n();
+  const navigate = useNavigate();
   const [, setSearchParams] = useSearchParams();
   const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -157,11 +161,26 @@ export function ChatSessionList({
     [activeSessionId, onPicked, setSearchParams],
   );
 
+  // Management hand-off. The Sessions page owns delete / rename / export /
+  // bulk cleanup; this panel only points at the row so there is exactly one
+  // implementation of those actions. The profile travels in the query string
+  // because the Sessions page resolves its rows from the management profile,
+  // and this rail may be scoped to a different one.
+  const manageInSessions = useCallback(
+    (id: string) => {
+      onPicked?.();
+      const params = new URLSearchParams({ session: id });
+      if (scopeKey) params.set("profile", scopeKey);
+      navigate(`/sessions?${params.toString()}`);
+    },
+    [navigate, onPicked, scopeKey],
+  );
+
   // "New chat" prefers ChatPage's robust handler (clears resume + forces a
   // PTY respawn even from an already-fresh session). Fallback: clear the
   // resume param ourselves, which spawns a fresh PTY whenever one was being
-  // resumed. Session management (delete/rename/export) lives on the Sessions
-  // page; this panel only switches and starts conversations.
+  // resumed. Session management (delete/rename/export) still lives on the
+  // Sessions page — this panel switches, starts, and hands off.
   const startNew = useCallback(() => {
     onPicked?.();
     if (onNewChat) {
@@ -210,43 +229,64 @@ export function ChatSessionList({
       <div className="flex flex-col gap-0.5">
         {sessions.map((s) => {
           const isActive = s.id === activeSessionId;
+          const label = rowLabel(s, t.sessions.untitledSession);
           return (
-            <ListItem
-              key={s.id}
-              onClick={() => pick(s.id)}
-              aria-current={isActive ? "true" : undefined}
-              className={cn(
-                "flex-col items-start gap-0.5 rounded px-2 py-1.5",
-                "normal-case tracking-normal",
-                isActive
-                  ? "bg-primary/10 text-foreground border-l-2 border-primary"
-                  : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
-              )}
-            >
-              <span className="w-full truncate text-sm font-medium">
-                {rowLabel(s, t.sessions.untitledSession)}
-              </span>
-              <span className="flex w-full items-center gap-1.5 text-[0.6875rem] text-text-tertiary">
-                <span>{timeAgo(s.last_active)}</span>
-                {s.message_count > 0 && (
-                  <>
-                    <span aria-hidden>·</span>
-                    <span>{s.message_count} msgs</span>
-                  </>
+            // The row is a button (ListItem), so the manage control sits
+            // BESIDE it rather than nested — a button inside a button is
+            // invalid HTML and breaks keyboard activation. Both share a
+            // `group` so hovering either reveals the action.
+            <div key={s.id} className="group flex min-w-0 items-center gap-0.5">
+              <ListItem
+                onClick={() => pick(s.id)}
+                aria-current={isActive ? "true" : undefined}
+                className={cn(
+                  "min-w-0 flex-1 flex-col items-start gap-0.5 rounded px-2 py-1.5",
+                  "normal-case tracking-normal",
+                  isActive
+                    ? "bg-primary/10 text-foreground border-l-2 border-primary"
+                    : "text-text-secondary hover:bg-midground/5 hover:text-foreground",
                 )}
-                {s.source && s.source !== "cli" && (
-                  <>
-                    <span aria-hidden>·</span>
-                    <span className="truncate">{s.source}</span>
-                  </>
+              >
+                <span className="w-full truncate text-sm font-medium">
+                  {label}
+                </span>
+                <span className="flex w-full items-center gap-1.5 text-[0.6875rem] text-text-tertiary">
+                  <span>{timeAgo(s.last_active)}</span>
+                  {s.message_count > 0 && (
+                    <>
+                      <span aria-hidden>·</span>
+                      <span>{s.message_count} msgs</span>
+                    </>
+                  )}
+                  {s.source && s.source !== "cli" && (
+                    <>
+                      <span aria-hidden>·</span>
+                      <span className="truncate">{s.source}</span>
+                    </>
+                  )}
+                </span>
+              </ListItem>
+              <Button
+                ghost
+                size="icon"
+                onClick={() => manageInSessions(s.id)}
+                aria-label={`${t.sessions.manageInSessions}: ${label}`}
+                title={t.sessions.manageInSessions}
+                className={cn(
+                  "shrink-0 text-text-tertiary opacity-0 transition-opacity",
+                  "group-hover:opacity-100 focus-visible:opacity-100 hover:text-foreground",
+                  // No hover on touch — keep the hand-off permanently visible.
+                  "max-md:opacity-100",
                 )}
-              </span>
-            </ListItem>
+              >
+                <SlidersHorizontal />
+              </Button>
+            </div>
           );
         })}
       </div>
     );
-  }, [activeSessionId, error, loading, pick, reload, sessions, t]);
+  }, [activeSessionId, error, loading, manageInSessions, pick, reload, sessions, t]);
 
   return (
     <aside

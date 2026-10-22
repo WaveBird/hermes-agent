@@ -2,7 +2,7 @@
 
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { MemoryRouter } from 'react-router'
+import { MemoryRouter, useLocation } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ChatSessionList } from './ChatSessionList'
@@ -50,6 +50,7 @@ vi.mock('@/i18n', () => ({
     t: {
       common: { loading: 'Loading', refresh: 'Refresh', retry: 'Retry' },
       sessions: {
+        manageInSessions: 'Manage in Sessions',
         newChat: 'New chat',
         noSessions: 'No sessions',
         title: 'Sessions',
@@ -195,4 +196,37 @@ describe('ChatSessionList', () => {
     expect(getSessions).toHaveBeenCalledTimes(2)
     expect(container.textContent).toContain('Newly created session')
   })
+
+  it('hands a row off to the Sessions page instead of reimplementing delete here', async () => {
+    getSessions.mockResolvedValueOnce(response('first', 'First session'))
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter initialEntries={['/chat']}>
+          <ChatSessionList activeSessionId={null} profile="worker" />
+          <LocationProbe />
+        </MemoryRouter>
+      )
+    })
+
+    const manage = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Manage in Sessions: First session"]'
+    )
+    expect(manage).not.toBeNull()
+
+    await act(async () => {
+      manage?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    })
+
+    // The panel is a switcher: management lives on /sessions, which resolves
+    // the id into a pinned, expanded row (SessionsPage `?session=` support).
+    expect(container.querySelector('[data-testid="location"]')?.textContent).toBe(
+      '/sessions?session=first&profile=worker'
+    )
+  })
 })
+
+function LocationProbe() {
+  const location = useLocation()
+  return <div data-testid="location">{location.pathname + location.search}</div>
+}

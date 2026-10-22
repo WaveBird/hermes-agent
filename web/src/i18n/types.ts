@@ -221,6 +221,12 @@ export interface Translations {
     failedToDeleteSelected: string;
     resumeInChat: string;
     newChat: string;
+    /** Chat rail → Sessions hand-off: opens the row in the Sessions page. */
+    manageInSessions: string;
+    /** Heading above the row pinned by a `/sessions?session=<id>` deep link. */
+    linkedSession: string;
+    /** Toast when a deep-linked session no longer exists. */
+    linkedSessionMissing: string;
     workspace: string;
     workspaceDefault: string;
     workspaceRescan: string;
